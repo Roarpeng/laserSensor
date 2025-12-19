@@ -16,6 +16,7 @@ private:
     unsigned long lastUpdateTime;
     bool isWebServerRunning;
     int clientCount;
+    unsigned long baselineDelay; // 基线延迟设置
 
 public:
     LaserWebServer();

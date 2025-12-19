@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <HardwareSerial.h>
+#include <cstring>
 #include "WebServer.h"
 
 // ============== RS485 PINS ==============
@@ -24,6 +25,39 @@ const char* changeState_topic = "changeState";
 #define NUM_DEVICES 4
 #define NUM_INPUTS_PER_DEVICE 48
 
+// ============== Hardware Mapping Table ==============
+struct HardwareCoord {
+    uint8_t row;
+    uint8_t col;
+};
+
+const HardwareCoord INDEX_MAP[144] = {
+    // --- Index 0 - 11 (对应 map 里的 Row 0) ---
+    {6,0}, {6,1}, {6,2}, {6,3}, {6,4}, {6,5}, {7,0}, {7,1}, {7,2}, {7,3}, {7,4}, {7,5},
+    // --- Index 12 - 23 ---
+    {8,0}, {8,1}, {8,2}, {8,3}, {8,4}, {8,5}, {9,0}, {9,1}, {9,2}, {9,3}, {9,4}, {9,5},
+    // --- Index 24 - 35 ---
+    {10,1}, {10,0}, {10,2}, {10,3}, {10,4}, {10,5}, {11,0}, {11,1}, {11,2}, {11,3}, {11,4}, {11,5},
+    // --- Index 36 - 47 (这里包含你要找的 0,0) ---
+    {0,3}, {0,1}, {0,2}, {0,0}, {0,4}, {0,5}, {1,0}, {1,1}, {1,2}, {1,3}, {1,4}, {1,5},
+    // --- Index 48 - 59 ---
+    {2,0}, {2,1}, {2,2}, {2,3}, {2,4}, {2,5}, {3,0}, {3,1}, {3,2}, {3,4}, {3,3}, {3,5},
+    // --- Index 60 - 71 ---
+    {4,0}, {4,1}, {4,2}, {4,3}, {4,4}, {4,5}, {5,0}, {5,1}, {5,2}, {5,3}, {5,4}, {5,5},
+    // --- Index 72 - 83 ---
+    {6,11}, {6,10}, {6,9}, {6,8}, {6,7}, {6,6}, {7,11}, {7,10}, {7,9}, {7,8}, {7,7}, {7,6},
+    // --- Index 84 - 95 ---
+    {8,11}, {8,10}, {8,9}, {8,8}, {8,7}, {8,6}, {9,11}, {9,10}, {9,9}, {9,8}, {9,7}, {9,6},
+    // --- Index 96 - 107 ---
+    {10,11}, {10,10}, {10,9}, {10,8}, {10,7}, {10,6}, {11,11}, {11,10}, {11,9}, {11,8}, {11,7}, {11,6},
+    // --- Index 108 - 119 ---
+    {0,11}, {0,10}, {0,9}, {0,7}, {0,8}, {0,6}, {1,11}, {1,10}, {1,9}, {1,8}, {1,7}, {1,6},
+    // --- Index 120 - 131 ---
+    {2,11}, {2,10}, {2,9}, {2,8}, {2,7}, {2,6}, {3,11}, {3,10}, {3,9}, {3,8}, {3,7}, {3,6},
+    // --- Index 132 - 143 ---
+    {4,11}, {4,10}, {4,9}, {4,8}, {4,7}, {4,6}, {5,11}, {5,10}, {5,9}, {5,8}, {5,7}, {5,6}
+};
+
 // ============== Global Objects ==============
 HardwareSerial rs485Serial(1);
 WiFiClient espClient;
@@ -39,6 +73,7 @@ bool readFailWaitActive = false;
 int currentDevice = 1;
 
 // ============== Baseline State Variables ==============
+String lastChangeStatePayload = ""; // 用于存储上一次changeState报文的内容
 bool baselineMode = false;
 unsigned long baselineSetTime = 0;
 unsigned long lastBaselineCheck = 0;
@@ -77,10 +112,25 @@ void callback(char* topic, byte* payload, unsigned int length) {
     
     // 检查是否是changeState主题
     if (strcmp(topic, changeState_topic) == 0) {
-        Serial.printf("ChangeState message received, will set baseline after %d ms delay...\n", baselineDelay);
-        baselineMode = true;
-        baselineInitialized = false;
-        baselineSetTime = millis() + baselineDelay; // 设置延迟时间
+        // 将 payload 转换为 String，以便比较
+        String payloadStr;
+        for (unsigned int i = 0; i < length; i++) {
+            payloadStr += (char)payload[i];
+        }
+
+        // 检查报文内容是否与上一次的相同
+        if (payloadStr != lastChangeStatePayload) {
+            Serial.printf("New 'changeState' payload received ('%s'). Previous was ('%s').\n", payloadStr.c_str(), lastChangeStatePayload.c_str());
+            Serial.printf("Will set baseline after %d ms delay...\n", baselineDelay);
+            
+            // 更新最后一次的报文内容并启动基线模式
+            lastChangeStatePayload = payloadStr;
+            baselineMode = true;
+            baselineInitialized = false;
+            baselineSetTime = millis() + baselineDelay; // 设置延迟时间
+        } else {
+            Serial.printf("Received 'changeState' payload ('%s') is the same as the last one. Ignoring.\n", payloadStr.c_str());
+        }
     }
 }
 
@@ -99,7 +149,6 @@ void reconnect() {
         }
     }
 }
-
 uint16_t crc16(const uint8_t *data, uint8_t length) {
     uint16_t crc = 0xFFFF;
     for (uint8_t i = 0; i < length; i++) {
