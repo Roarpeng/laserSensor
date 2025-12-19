@@ -332,8 +332,16 @@ void loop() {
             if (checkForChanges()) {
                 Serial.println("State change detected, sending MQTT trigger");
                 client.publish(mqtt_topic, "");
-                // 可以选择是否退出基线模式或继续监控
-                // baselineMode = false; // 如果需要退出基线模式，取消注释
+                
+                // 检查是否是第一次receiver/triggered触发
+                if (!receiverTriggered) {
+                    Serial.println("First receiver/triggered detected, deactivating system");
+                    receiverTriggered = true;
+                    systemActive = false;
+                    // 停止基线模式
+                    baselineMode = false;
+                    baselineInitialized = false;
+                }
             }
         }
         return; // 基线模式下不执行正常扫描
