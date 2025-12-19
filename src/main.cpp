@@ -142,8 +142,14 @@ void callback(char* topic, byte* payload, unsigned int length) {
 }
 
 void reconnect() {
-    while (!client.connected()) {
+    // 使用静态变量记录重连时间，避免阻塞
+    static unsigned long lastReconnectAttempt = 0;
+    unsigned long currentTime = millis();
+
+    if (currentTime - lastReconnectAttempt > 5000) {
+        lastReconnectAttempt = currentTime;
         Serial.print("Attempting MQTT connection...");
+
         if (client.connect(mqtt_client_id)) {
             Serial.println("connected");
             client.subscribe(mqtt_topic);
@@ -152,8 +158,7 @@ void reconnect() {
         } else {
             Serial.print("failed, rc=");
             Serial.print(client.state());
-            Serial.println(" try again in 5 seconds");
-            delay(5000);
+            Serial.println(" will retry in 5 seconds");
         }
     }
 }
@@ -287,12 +292,21 @@ void setup() {
     setup_wifi();
     client.setServer(mqtt_server, 1883);
     client.setCallback(callback);
+    client.setKeepAlive(60); // 设置 keepalive 为60秒
+    client.setSocketTimeout(15); // 设置 socket 超时为15秒
 
     // 启动Web服务器
     webServer.begin();
 
     // 同步基线延迟设置到WebServer
     webServer.setBaselineDelay(baselineDelay);
+
+    // 初始化所有设备状态为0（确保WebUI有数据显示）
+    uint8_t zeroStates[NUM_INPUTS_PER_DEVICE] = {0};
+    for (int device = 1; device <= NUM_DEVICES; device++) {
+        webServer.updateAllDeviceStates(device, zeroStates);
+    }
+    Serial.println("Initialized all device states to 0");
 
     // 初始化计时变量
     lastTriggerTime = 0;
@@ -306,10 +320,14 @@ void setup() {
 }
 
 void loop() {
+    // 非阻塞的 MQTT 重连
     if (!client.connected()) {
         reconnect();
     }
-    client.loop();
+    // 只有连接成功才处理 MQTT 消息
+    if (client.connected()) {
+        client.loop();
+    }
 
     // 处理Web客户端请求（修复WebUI无法访问问题）
     webServer.handleClient();

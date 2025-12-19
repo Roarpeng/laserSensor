@@ -30,12 +30,9 @@ void LaserWebServer::handleClient() {
             if(clients[i].available()) {
                 handleHTTPRequest(clients[i]);
             }
-        } else {
-            // 如果客户端断开连接，重置计数
-            if(clientCount > 0) {
-                clientCount--;
-                Serial.println("Client disconnected");
-            }
+        } else if (clients[i]) {
+            // 如果客户端断开连接，清理槽位
+            clients[i].stop();
         }
     }
 
@@ -43,7 +40,7 @@ void LaserWebServer::handleClient() {
     WiFiClient newClient = server.available();
     if (newClient) {
         Serial.println("New client connected");
-        
+
         // 找到空槽位
         bool clientStored = false;
         for(int i = 0; i < 4; i++) {
@@ -61,12 +58,7 @@ void LaserWebServer::handleClient() {
             newClient.stop();
         }
     }
-    
-    // 定期广播状态更新
-    if(millis() - lastUpdateTime > 1000) { // 每秒更新一次
-        broadcastStates();
-        lastUpdateTime = millis();
-    }
+    // 注意：广播由 main.cpp 的 loop() 统一管理，这里不再重复广播
 }
 
 void LaserWebServer::updateDeviceState(uint8_t deviceAddr, uint8_t inputNum, bool state) {
@@ -190,19 +182,21 @@ void LaserWebServer::handleHTTPRequest(WiFiClient& client) {
         response += "Access-Control-Allow-Origin: *\r\n";
         response += "\r\n";
         client.print(response);
-        
+
         // 发送初始数据
         String json = getDeviceStatesJSON();
         sendWebSocketUpdate(client, json);
+
+        // SSE 连接不关闭，保持连接用于持续推送
+        return;
     }
     else {
         // 404错误
         String notFound = "<html><body><h1>404 Not Found</h1></body></html>";
         client.print(getHTTPResponse("text/html", notFound));
     }
-    
-    // 延迟关闭连接以允许数据传输
-    delay(10);
+
+    // 非SSE连接立即关闭
     client.stop();
 }
 
