@@ -29,6 +29,9 @@ public:
     void handleHTTPRequest(WiFiClient& client);
     String getHTTPResponse(const String& contentType, const String& content);
     void sendWebSocketUpdate(WiFiClient& client, const String& data);
+    void setBaselineDelay(unsigned long delay);
+    unsigned long getBaselineDelay();
+    String getBaselineDelayJSON();
 };
 
 #endif

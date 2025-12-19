@@ -4,6 +4,7 @@ LaserWebServer::LaserWebServer() : server(80) {
     lastUpdateTime = 0;
     isWebServerRunning = false;
     clientCount = 0;
+    baselineDelay = 200; // 默认200ms延迟
     
     // 初始化客户端数组
     for(int i = 0; i < 4; i++) {
@@ -158,6 +159,39 @@ void LaserWebServer::handleHTTPRequest(WiFiClient& client) {
         String json = getDeviceStatesJSON();
         sendWebSocketUpdate(client, json);
     }
+    else if(request.indexOf("GET /api/baselineDelay") >= 0) {
+        // 获取基线延迟设置
+        String json = getBaselineDelayJSON();
+        client.print(getHTTPResponse("application/json", json));
+    }
+    else if(request.indexOf("POST /api/baselineDelay") >= 0) {
+        // 设置基线延迟
+        // 简单解析POST请求体
+        String body = "";
+        bool bodyStarted = false;
+        while(client.available()) {
+            String line = client.readStringUntil('\r');
+            if(bodyStarted) {
+                body += line;
+            }
+            if(line.length() == 0) {
+                bodyStarted = true;
+            }
+        }
+        
+        // 解析JSON获取延迟值
+        DynamicJsonDocument doc(256);
+        if(deserializeJson(doc, body) == DeserializationError::Ok) {
+            unsigned long delay = doc["delay"];
+            setBaselineDelay(delay);
+            
+            String responseJson = getBaselineDelayJSON();
+            client.print(getHTTPResponse("application/json", responseJson));
+        } else {
+            String errorJson = "{\"error\":\"Invalid JSON\"}";
+            client.print(getHTTPResponse("application/json", errorJson));
+        }
+    }
     else {
         // 404错误
         String notFound = "<html><body><h1>404 Not Found</h1></body></html>";
@@ -267,11 +301,72 @@ String LaserWebServer::getHTMLPage() {
             background-color: #f8d7da;
             color: #721c24;
         }
+        .control-panel {
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+        .control-group label {
+            font-weight: bold;
+            min-width: 120px;
+        }
+        .control-group input {
+            padding: 8px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            width: 100px;
+        }
+        .control-group button {
+            padding: 8px 15px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .control-group button:hover {
+            background-color: #0056b3;
+        }
+        .status-message {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 4px;
+            display: none;
+        }
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>激光传感器实时监控系统</h1>
+        
+        <div class="control-panel">
+            <h3>基线设置控制</h3>
+            <div class="control-group">
+                <label>基线延迟(ms):</label>
+                <input type="number" id="baselineDelay" min="0" max="5000" step="50" value="200">
+                <button onclick="setBaselineDelay()">设置延迟</button>
+                <button onclick="getCurrentBaselineDelay()">获取当前值</button>
+            </div>
+            <div id="statusMessage" class="status-message"></div>
+        </div>
         
         <div class="status-bar">
             <span>连接状态: </span>
@@ -289,12 +384,59 @@ String LaserWebServer::getHTMLPage() {
         let eventSource;
         let deviceData = {};
 
+        function setBaselineDelay() {
+            const delay = document.getElementById('baselineDelay').value;
+            
+            fetch('/api/baselineDelay', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ delay: parseInt(delay) })
+            })
+            .then(response => response.json())
+            .then(data => {
+                showStatusMessage('基线延迟已设置为 ' + delay + 'ms', 'success');
+            })
+            .catch(error => {
+                console.error('设置基线延迟失败:', error);
+                showStatusMessage('设置基线延迟失败', 'error');
+            });
+        }
+
+        function getCurrentBaselineDelay() {
+            fetch('/api/baselineDelay')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('baselineDelay').value = data.delay;
+                showStatusMessage('当前基线延迟: ' + data.delay + 'ms', 'success');
+            })
+            .catch(error => {
+                console.error('获取基线延迟失败:', error);
+                showStatusMessage('获取基线延迟失败', 'error');
+            });
+        }
+
+        function showStatusMessage(message, type) {
+            const statusElement = document.getElementById('statusMessage');
+            statusElement.textContent = message;
+            statusElement.className = 'status-message ' + type;
+            statusElement.style.display = 'block';
+            
+            // 3秒后自动隐藏消息
+            setTimeout(() => {
+                statusElement.style.display = 'none';
+            }, 3000);
+        }
+
         function initEventSource() {
             eventSource = new EventSource('/events');
             
             eventSource.onopen = function() {
                 console.log('EventSource连接已建立');
                 updateConnectionStatus(true);
+                // 页面加载时获取当前基线延迟设置
+                getCurrentBaselineDelay();
             };
             
             eventSource.onmessage = function(event) {
@@ -401,4 +543,21 @@ String LaserWebServer::getHTMLPage() {
 </body>
 </html>
 )";
+}
+
+void LaserWebServer::setBaselineDelay(unsigned long delay) {
+    baselineDelay = delay;
+}
+
+unsigned long LaserWebServer::getBaselineDelay() {
+    return baselineDelay;
+}
+
+String LaserWebServer::getBaselineDelayJSON() {
+    DynamicJsonDocument doc(256);
+    doc["delay"] = baselineDelay;
+    
+    String output;
+    serializeJson(doc, output);
+    return output;
 }

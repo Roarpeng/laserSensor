@@ -17,6 +17,7 @@ const char* password = "12345678";
 const char* mqtt_server = "192.168.10.80";
 const char* mqtt_client_id = "receiver";
 const char* mqtt_topic = "receiver/triggered";
+const char* changeState_topic = "changeState";
 
 // ============== Modbus Device Settings ==============
 #define BAUD_RATE 9600
@@ -37,7 +38,13 @@ bool triggerWaitActive = false;
 bool readFailWaitActive = false;
 int currentDevice = 1;
 
-
+// ============== Baseline State Variables ==============
+bool baselineMode = false;
+unsigned long baselineSetTime = 0;
+unsigned long lastBaselineCheck = 0;
+uint8_t baseline[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
+bool baselineInitialized = false;
+unsigned long baselineDelay = 200; // 基线设置延迟时间(毫秒)，可通过WebUI调整
 
 void setup_wifi() {
     delay(10);
@@ -67,6 +74,14 @@ void callback(char* topic, byte* payload, unsigned int length) {
         Serial.print((char)payload[i]);
     }
     Serial.println();
+    
+    // 检查是否是changeState主题
+    if (strcmp(topic, changeState_topic) == 0) {
+        Serial.printf("ChangeState message received, will set baseline after %d ms delay...\n", baselineDelay);
+        baselineMode = true;
+        baselineInitialized = false;
+        baselineSetTime = millis() + baselineDelay; // 设置延迟时间
+    }
 }
 
 void reconnect() {
@@ -75,6 +90,7 @@ void reconnect() {
         if (client.connect(mqtt_client_id)) {
             Serial.println("connected");
             client.subscribe(mqtt_topic);
+            client.subscribe(changeState_topic);
         } else {
             Serial.print("failed, rc=");
             Serial.print(client.state());
@@ -154,6 +170,44 @@ bool readInputStatus(uint8_t deviceAddress, uint8_t* status_array) {
     return false;
 }
 
+void setBaseline() {
+    Serial.println("Setting baseline state...");
+    for (int device = 1; device <= NUM_DEVICES; device++) {
+        bool readSuccess = readInputStatus(device, baseline[device - 1]);
+        if (!readSuccess) {
+            Serial.printf("Failed to read device %d for baseline\n", device);
+            baseline[device - 1][0] = 0xFF; // 设置为无效值
+        } else {
+            Serial.printf("Baseline set for device %d\n", device);
+        }
+    }
+    baselineInitialized = true;
+    Serial.println("Baseline setup completed");
+}
+
+bool checkForChanges() {
+    if (!baselineInitialized) return false;
+    
+    for (int device = 1; device <= NUM_DEVICES; device++) {
+        uint8_t currentStatus[NUM_INPUTS_PER_DEVICE];
+        bool readSuccess = readInputStatus(device, currentStatus);
+        
+        if (readSuccess) {
+            // 更新Web服务器的设备状态
+            webServer.updateAllDeviceStates(device, currentStatus);
+            
+            // 检查是否有变化
+            for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+                if (currentStatus[i] != baseline[device - 1][i]) {
+                    Serial.printf("Change detected on Device %d, Input %d\n", device, i + 1);
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 void setup() {
     Serial.begin(115200);
     rs485Serial.begin(BAUD_RATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
@@ -170,6 +224,9 @@ void setup() {
     
     // 启动Web服务器
     webServer.begin();
+    
+    // 同步基线延迟设置到WebServer
+    webServer.setBaselineDelay(baselineDelay);
     
     // 初始化计时变量
     lastTriggerTime = 0;
@@ -190,6 +247,34 @@ void loop() {
     webServer.handleClient();
 
     unsigned long currentTime = millis();
+    
+    // 定期同步WebServer的基线延迟设置
+    static unsigned long lastSyncTime = 0;
+    if (currentTime - lastSyncTime >= 1000) { // 每秒同步一次
+        baselineDelay = webServer.getBaselineDelay();
+        lastSyncTime = currentTime;
+    }
+    
+    // 基线模式逻辑
+    if (baselineMode) {
+        // 检查是否到了设置基线的时间
+        if (!baselineInitialized && currentTime >= baselineSetTime) {
+            setBaseline();
+            lastBaselineCheck = currentTime;
+        }
+        
+        // 如果基线已设置，每100ms检查一次变化
+        if (baselineInitialized && currentTime - lastBaselineCheck >= 100) {
+            lastBaselineCheck = currentTime;
+            if (checkForChanges()) {
+                Serial.println("State change detected, sending MQTT trigger");
+                client.publish(mqtt_topic, "");
+                // 可以选择是否退出基线模式或继续监控
+                // baselineMode = false; // 如果需要退出基线模式，取消注释
+            }
+        }
+        return; // 基线模式下不执行正常扫描
+    }
     
     // 处理触发后的等待状态
     if (triggerWaitActive) {
