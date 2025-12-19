@@ -19,7 +19,7 @@ const char* mqtt_server = "192.168.10.80";
 const char* mqtt_client_id = "receiver";
 const char* mqtt_topic = "receiver/triggered";
 const char* changeState_topic = "changeState";
-const char* tbg_trigger_topic = "tbg/triggered";
+const char* btn_resetAll_topic = "btn/resetAll";  // 系统激活主题
 
 // ============== Modbus Device Settings ==============
 #define BAUD_RATE 9600
@@ -28,11 +28,11 @@ const char* tbg_trigger_topic = "tbg/triggered";
 
 // ============== System State Machine ==============
 enum SystemState {
-    IDLE,              // 初始状态：等待 tbg/triggered 激活
+    IDLE,              // 初始状态：等待 btn/resetAll 激活
     SCANNING,          // 正常扫描模式：检测任意输入触发
     BASELINE_WAITING,  // 等待基线延迟
     BASELINE_ACTIVE,   // 基线监控中：检测与基线的差异
-    TRIGGERED          // 已触发：等待 tbg/triggered 重新激活
+    TRIGGERED          // 已触发：等待 btn/resetAll 重新激活
 };
 SystemState currentState = IDLE;
 
@@ -49,7 +49,7 @@ const HardwareCoord INDEX_MAP[144] = {
     {8,0}, {8,1}, {8,2}, {8,3}, {8,4}, {8,5}, {9,0}, {9,1}, {9,2}, {9,3}, {9,4}, {9,5},
     // --- Index 24 - 35 ---
     {10,1}, {10,0}, {10,2}, {10,3}, {10,4}, {10,5}, {11,0}, {11,1}, {11,2}, {11,3}, {11,4}, {11,5},
-    // --- Index 36 - 47 (这里包含你要找的 0,0) ---
+    // --- Index 36 - 47 
     {0,3}, {0,1}, {0,2}, {0,0}, {0,4}, {0,5}, {1,0}, {1,1}, {1,2}, {1,3}, {1,4}, {1,5},
     // --- Index 48 - 59 ---
     {2,0}, {2,1}, {2,2}, {2,3}, {2,4}, {2,5}, {3,0}, {3,1}, {3,2}, {3,4}, {3,3}, {3,5},
@@ -116,9 +116,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
     }
     Serial.println();
 
-    // 处理 tbg/triggered 主题 - 激活系统
-    if (strcmp(topic, tbg_trigger_topic) == 0) {
-        Serial.printf("TBG trigger received (from %s state), activating system to SCANNING mode\n",
+    // 处理 btn/resetAll 主题 - 激活系统
+    if (strcmp(topic, btn_resetAll_topic) == 0) {
+        Serial.printf("btn/resetAll received (from %s state), activating system to SCANNING mode\n",
                       currentState == IDLE ? "IDLE" :
                       currentState == TRIGGERED ? "TRIGGERED" : "ACTIVE");
         currentState = SCANNING;
@@ -154,7 +154,7 @@ void reconnect() {
             Serial.println("connected");
             client.subscribe(mqtt_topic);
             client.subscribe(changeState_topic);
-            client.subscribe(tbg_trigger_topic);
+            client.subscribe(btn_resetAll_topic);
         } else {
             Serial.print("failed, rc=");
             Serial.print(client.state());
@@ -314,9 +314,9 @@ void setup() {
     lastScanTime = 0;
     currentDevice = 1;
 
-    // 初始化系统状态为 IDLE（等待 tbg/triggered 激活）
+    // 初始化系统状态为 IDLE（等待 btn/resetAll 激活）
     currentState = IDLE;
-    Serial.println("System initialized in IDLE state, waiting for tbg/triggered...");
+    Serial.println("System initialized in IDLE state, waiting for btn/resetAll...");
 }
 
 void loop() {
@@ -351,7 +351,7 @@ void loop() {
     // 状态机主逻辑
     switch (currentState) {
         case IDLE:
-            // 等待 tbg/triggered MQTT 消息激活系统
+            // 等待 btn/resetAll MQTT 消息激活系统
             // 在此状态下不进行任何扫描操作
             break;
 
@@ -414,9 +414,9 @@ void loop() {
             break;
 
         case TRIGGERED:
-            // 触发后冷却期，等待 tbg/triggered 重新激活
+            // 触发后冷却期，等待 btn/resetAll 重新激活
             // 冷却期内不处理任何扫描，仅响应 MQTT 消息
-            // 系统将保持在此状态直到收到新的 tbg/triggered
+            // 系统将保持在此状态直到收到新的 btn/resetAll
             break;
     }
 }
