@@ -29,10 +29,9 @@ const char* btn_resetAll_topic = "btn/resetAll";  // 系统激活主题
 // ============== System State Machine ==============
 enum SystemState {
     IDLE,              // 初始状态：等待 btn/resetAll 激活
-    SCANNING,          // 正常扫描模式：检测任意输入触发
+    ACTIVE,            // 激活状态：等待 changeState 设置基线
     BASELINE_WAITING,  // 等待基线延迟
-    BASELINE_ACTIVE,   // 基线监控中：检测与基线的差异
-    TRIGGERED          // 已触发：等待 btn/resetAll 重新激活
+    BASELINE_ACTIVE    // 基线监控中：检测与基线的差异
 };
 SystemState currentState = IDLE;
 
@@ -86,6 +85,7 @@ unsigned long baselineSetTime = 0;
 unsigned long lastBaselineCheck = 0;
 uint8_t baseline[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 unsigned long baselineDelay = 200; // 基线设置延迟时间(毫秒)，可通过WebUI调整
+bool triggerSent = false; // 标记是否已发送触发消息
 
 void setup_wifi() {
     delay(10);
@@ -118,25 +118,21 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
     // 处理 btn/resetAll 主题 - 激活系统
     if (strcmp(topic, btn_resetAll_topic) == 0) {
-        Serial.printf("btn/resetAll received (from %s state), activating system to SCANNING mode\n",
-                      currentState == IDLE ? "IDLE" :
-                      currentState == TRIGGERED ? "TRIGGERED" : "ACTIVE");
-        currentState = SCANNING;
-        currentDevice = 1;
-        lastScanTime = 0;
+        Serial.printf("btn/resetAll received, activating system to ACTIVE state\n");
+        currentState = ACTIVE;
         return;
     }
 
-    // 处理 changeState 主题 - 启动基线模式
+    // 处理 changeState 主题 - 设置基线
     if (strcmp(topic, changeState_topic) == 0) {
-        if (currentState == IDLE || currentState == TRIGGERED) {
-            Serial.printf("System is in %s state, ignoring changeState message\n",
-                         currentState == IDLE ? "IDLE" : "TRIGGERED");
+        if (currentState == IDLE) {
+            Serial.println("System is IDLE, ignoring changeState message");
             return;
         }
-        Serial.printf("ChangeState message received, will set baseline after %lu ms delay...\n", baselineDelay);
+        Serial.printf("changeState received, will set baseline after %lu ms delay...\n", baselineDelay);
         currentState = BASELINE_WAITING;
         baselineSetTime = millis() + baselineDelay;
+        triggerSent = false; // 重置触发标志，允许下一次触发
         return;
     }
 }
@@ -273,10 +269,12 @@ bool checkForChanges() {
 
 // 统一的触发处理函数
 void handleTriggerDetected() {
-    Serial.println("Trigger detected, publishing MQTT message and entering TRIGGERED state");
-    client.publish(mqtt_topic, "");
-    currentState = TRIGGERED;
-    lastTriggerTime = millis();
+    if (!triggerSent) {
+        Serial.println("Trigger detected, publishing MQTT message (first time)");
+        client.publish(mqtt_topic, "");
+        triggerSent = true;
+    }
+    // 不改变状态，继续监控等待下一个 changeState
 }
 
 void setup() {
@@ -355,44 +353,10 @@ void loop() {
             // 在此状态下不进行任何扫描操作
             break;
 
-        case SCANNING: {
-            // 正常扫描模式：检测任意输入触发
-
-            // 控制扫描频率
-            if (currentTime - lastScanTime < 100) {
-                break;
-            }
-
-            // 执行设备扫描
-            uint8_t inputs[NUM_INPUTS_PER_DEVICE];
-            bool readSuccess = readInputStatus(currentDevice, inputs);
-
-            if (readSuccess) {
-                // 更新Web服务器的设备状态
-                webServer.updateAllDeviceStates(currentDevice, inputs);
-
-                // 检查是否有触发
-                for (int j = 0; j < NUM_INPUTS_PER_DEVICE; j++) {
-                    if (inputs[j] == 1) {
-                        Serial.printf("Trigger detected on Device %d, Input %d\n", currentDevice, j + 1);
-                        handleTriggerDetected();
-                        return;
-                    }
-                }
-
-                // 移动到下一个设备
-                currentDevice++;
-                if (currentDevice > NUM_DEVICES) {
-                    currentDevice = 1;
-                }
-                lastScanTime = currentTime;
-            } else {
-                // 读取失败，记录时间并等待
-                lastReadFailTime = currentTime;
-                Serial.printf("Read failed for device %d, waiting 200ms...\n", currentDevice);
-            }
+        case ACTIVE:
+            // 激活状态：等待 changeState 设置基线
+            // 在此状态下不进行扫描，等待 changeState 消息
             break;
-        }
 
         case BASELINE_WAITING:
             // 等待基线延迟时间到达
@@ -403,7 +367,7 @@ void loop() {
             break;
 
         case BASELINE_ACTIVE:
-            // 基线监控模式：检测与基线的差异
+            // 基线监控模式：每100ms检测与基线的差异
             if (currentTime - lastBaselineCheck >= 100) {
                 lastBaselineCheck = currentTime;
                 if (checkForChanges()) {
@@ -411,12 +375,7 @@ void loop() {
                     handleTriggerDetected();
                 }
             }
-            break;
-
-        case TRIGGERED:
-            // 触发后冷却期，等待 btn/resetAll 重新激活
-            // 冷却期内不处理任何扫描，仅响应 MQTT 消息
-            // 系统将保持在此状态直到收到新的 btn/resetAll
+            // 继续停留在 BASELINE_ACTIVE 状态，等待下一个 changeState
             break;
     }
 }
