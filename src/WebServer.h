@@ -11,7 +11,7 @@
 class LaserWebServer {
 private:
     WiFiServer server;
-    WiFiClient* clients[4]; // 支持最多4个客户端
+    WiFiClient clients[4]; // 支持最多4个客户端
     uint8_t deviceStates[4][48]; // 存储所有设备的状态
     unsigned long lastUpdateTime;
     bool isWebServerRunning;

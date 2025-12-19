@@ -301,11 +301,18 @@ void loop() {
     }
     client.loop();
 
-    // 处理Web服务器客户端
-    webServer.handleClient();
+    // With ESPAsyncWebServer, we no longer need to call a handleClient() method.
+    // The server runs in the background.
 
     unsigned long currentTime = millis();
     
+    // Periodically broadcast states to all connected SSE clients.
+    static unsigned long lastBroadcastTime = 0;
+    if (currentTime - lastBroadcastTime >= 1000) { // Every 1 second
+        webServer.broadcastStates();
+        lastBroadcastTime = currentTime;
+    }
+
     // 定期同步WebServer的基线延迟设置
     static unsigned long lastSyncTime = 0;
     if (currentTime - lastSyncTime >= 1000) { // 每秒同步一次

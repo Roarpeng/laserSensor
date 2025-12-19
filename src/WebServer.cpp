@@ -7,11 +7,6 @@ LaserWebServer::LaserWebServer() : server(80) {
     clientCount = 0;
     baselineDelay = 200; // 默认200ms延迟
     
-    // 初始化客户端数组
-    for(int i = 0; i < 4; i++) {
-        clients[i] = nullptr;
-    }
-    
     // 初始化所有设备状态为0
     for(int i = 0; i < 4; i++) {
         for(int j = 0; j < 48; j++) {
@@ -29,34 +24,41 @@ void LaserWebServer::begin() {
 }
 
 void LaserWebServer::handleClient() {
-    // 检查新客户端连接
-    WiFiClient newClient = server.available();
-    if (newClient) {
-        Serial.println("新客户端连接");
-        
-        // 找到空槽位
-        for(int i = 0; i < 4; i++) {
-            if(clients[i] == nullptr || !clients[i]->connected()) {
-                if(clients[i] != nullptr) {
-                    delete clients[i];
-                }
-                clients[i] = new WiFiClient(newClient);
-                clientCount++;
-                break;
+    // 处理现有客户端
+    for(int i = 0; i < 4; i++) {
+        if(clients[i].connected()) {
+            if(clients[i].available()) {
+                handleHTTPRequest(clients[i]);
+            }
+        } else {
+            // 如果客户端断开连接，重置计数
+            if(clientCount > 0) {
+                clientCount--;
+                Serial.println("Client disconnected");
             }
         }
     }
-    
-    // 处理现有客户端
-    for(int i = 0; i < 4; i++) {
-        if(clients[i] != nullptr && clients[i]->connected()) {
-            if(clients[i]->available()) {
-                handleHTTPRequest(*clients[i]);
+
+    // 检查新客户端连接
+    WiFiClient newClient = server.available();
+    if (newClient) {
+        Serial.println("New client connected");
+        
+        // 找到空槽位
+        bool clientStored = false;
+        for(int i = 0; i < 4; i++) {
+            if(!clients[i].connected()) {
+                clients[i] = newClient;
+                clientCount++;
+                clientStored = true;
+                Serial.printf("Client stored in slot %d\n", i);
+                break;
             }
-        } else if(clients[i] != nullptr) {
-            delete clients[i];
-            clients[i] = nullptr;
-            clientCount--;
+        }
+        if (!clientStored) {
+            // 没有可用插槽，拒绝连接
+            Serial.println("No free slots for new client, disconnecting.");
+            newClient.stop();
         }
     }
     
@@ -84,8 +86,8 @@ void LaserWebServer::updateAllDeviceStates(uint8_t deviceAddr, uint8_t* states) 
 void LaserWebServer::broadcastStates() {
     String json = getDeviceStatesJSON();
     for(int i = 0; i < 4; i++) {
-        if(clients[i] != nullptr && clients[i]->connected()) {
-            sendWebSocketUpdate(*clients[i], json);
+        if(clients[i].connected()) {
+            sendWebSocketUpdate(clients[i], json);
         }
     }
 }
@@ -135,8 +137,6 @@ void LaserWebServer::handleHTTPRequest(WiFiClient& client) {
         request += client.readStringUntil('\r');
     }
     
-    bool isEventStream = false;
-
     // 解析HTTP请求
     if(request.indexOf("GET / ") >= 0 || request.indexOf("GET /index.html") >= 0) {
         // 主页面请求
@@ -147,21 +147,6 @@ void LaserWebServer::handleHTTPRequest(WiFiClient& client) {
         // API状态请求
         String json = getDeviceStatesJSON();
         client.print(getHTTPResponse("application/json", json));
-    }
-    else if(request.indexOf("GET /events") >= 0) {
-        isEventStream = true;
-        // Server-Sent Events for real-time updates
-        String response = "HTTP/1.1 200 OK\r\n";
-        response += "Content-Type: text/event-stream\r\n";
-        response += "Cache-Control: no-cache\r\n";
-        response += "Connection: keep-alive\r\n";
-        response += "Access-Control-Allow-Origin: *\r\n";
-        response += "\r\n";
-        client.print(response);
-        
-        // 发送初始数据
-        String json = getDeviceStatesJSON();
-        sendWebSocketUpdate(client, json);
     }
     else if(request.indexOf("GET /api/baselineDelay") >= 0) {
         // 获取基线延迟设置
@@ -196,357 +181,362 @@ void LaserWebServer::handleHTTPRequest(WiFiClient& client) {
             client.print(getHTTPResponse("application/json", errorJson));
         }
     }
+    else if(request.indexOf("GET /events") >= 0) {
+        // Server-Sent Events for real-time updates
+        String response = "HTTP/1.1 200 OK\r\n";
+        response += "Content-Type: text/event-stream\r\n";
+        response += "Cache-Control: no-cache\r\n";
+        response += "Connection: keep-alive\r\n";
+        response += "Access-Control-Allow-Origin: *\r\n";
+        response += "\r\n";
+        client.print(response);
+        
+        // 发送初始数据
+        String json = getDeviceStatesJSON();
+        sendWebSocketUpdate(client, json);
+    }
     else {
         // 404错误
         String notFound = "<html><body><h1>404 Not Found</h1></body></html>";
         client.print(getHTTPResponse("text/html", notFound));
     }
     
-    if(!isEventStream) {
-        // 延迟关闭连接以允许数据传输
-        delay(10);
-        client.stop();
-    }
+    // 延迟关闭连接以允许数据传输
+    delay(10);
+    client.stop();
 }
 
 String LaserWebServer::getHTMLPage() {
-    return R"END_HTML(
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Laser Sensor Real-time Monitoring System</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            background-color: white;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            text-align: center;
-            color: #333;
-            margin-bottom: 30px;
-        }
-        .device-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-        .device-card {
-            border: 2px solid #ddd;
-            border-radius: 8px;
-            padding: 15px;
-            background-color: #fafafa;
-        }
-        .device-title {
-            font-size: 18px;
-            font-weight: bold;
-            margin-bottom: 15px;
-            color: #555;
-            text-align: center;
-        }
-        .input-grid {
-            display: grid;
-            grid-template-columns: repeat(8, 1fr);
-            gap: 3px;
-        }
-        .input-item {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            padding: 3px;
-            border-radius: 4px;
-            font-size: 10px;
-        }
-        .input-id {
-            font-weight: bold;
-            margin-bottom: 2px;
-        }
-        .input-state {
-            width: 20px;
-            height: 20px;
-            border-radius: 50%;
-            border: 1px solid #ccc;
-        }
-        .state-active {
-            background-color: #ff4444;
-            border-color: #cc0000;
-        }
-        .state-inactive {
-            background-color: #cccccc;
-        }
-        .status-bar {
-            text-align: center;
-            padding: 10px;
-            background-color: #e8f4fd;
-            border-radius: 4px;
-            margin-bottom: 20px;
-        }
-        .connection-status {
-            display: inline-block;
-            padding: 5px 10px;
-            border-radius: 4px;
-            font-weight: bold;
-        }
-        .connected {
-            background-color: #d4edda;
-            color: #155724;
-        }
-        .disconnected {
-            background-color: #f8d7da;
-            color: #721c24;
-        }
-        .control-panel {
-            background-color: #f8f9fa;
-            border: 1px solid #dee2e6;
-            border-radius: 8px;
-            padding: 20px;
-            margin-bottom: 20px;
-        }
-        .control-group {
-            display: flex;
-            align-items: center;
-            gap: 15px;
-            margin-bottom: 15px;
-        }
-        .control-group label {
-            font-weight: bold;
-            min-width: 120px;
-        }
-        .control-group input {
-            padding: 8px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-            width: 100px;
-        }
-        .control-group button {
-            padding: 8px 15px;
-            background-color: #007bff;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-        }
-        .control-group button:hover {
-            background-color: #0056b3;
-        }
-        .status-message {
-            margin-top: 10px;
-            padding: 10px;
-            border-radius: 4px;
-            display: none;
-        }
-        .success {
-            background-color: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-        }
-        .error {
-            background-color: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Laser Sensor Real-time Monitoring System</h1>
-        
-        <div class="control-panel">
-            <h3>Baseline Settings Control</h3>
-            <div class="control-group">
-                <label>Baseline Delay (ms):</label>
-                <input type="number" id="baselineDelay" min="0" max="5000" step="50" value="200">
-                <button onclick="setBaselineDelay()">Set Delay</button>
-                <button onclick="getCurrentBaselineDelay()">Get Current</button>
-            </div>
-            <div id="statusMessage" class="status-message"></div>
-        </div>
-        
-        <div class="status-bar">
-            <span>Connection Status: </span>
-            <span id="connectionStatus" class="connection-status disconnected">Disconnected</span>
-            <span style="margin-left: 20px;">Last Update: </span>
-            <span id="lastUpdate">--:--:--</span>
-        </div>
-
-        <div class="device-grid" id="deviceContainer">
-            <!-- Device cards will be dynamically generated by JavaScript -->
-        </div>
-    </div>
-
-    <script>
-        var eventSource;
-        var deviceData = {};
-
-        function setBaselineDelay() {
-            var delay = document.getElementById('baselineDelay').value;
-            
-            fetch('/api/baselineDelay', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ delay: parseInt(delay) })
-            })
-            .then(response => response.json())
-            .then(data => {
-                showStatusMessage('Baseline delay set to ' + delay + 'ms', 'success');
-            })
-            .catch(error => {
-                console.error('Failed to set baseline delay:', error);
-                showStatusMessage('Failed to set baseline delay', 'error');
-            });
-        }
-
-        function getCurrentBaselineDelay() {
-            fetch('/api/baselineDelay')
-            .then(response => response.json())
-            .then(data => {
-                document.getElementById('baselineDelay').value = data.delay;
-                showStatusMessage('Current baseline delay: ' + data.delay + 'ms', 'success');
-            })
-            .catch(error => {
-                console.error('Failed to get baseline delay:', error);
-                showStatusMessage('Failed to get baseline delay', 'error');
-            });
-        }
-
-        function showStatusMessage(message, type) {
-            var statusElement = document.getElementById('statusMessage');
-            statusElement.textContent = message;
-            statusElement.className = 'status-message ' + type;
-            statusElement.style.display = 'block';
-            
-            // Auto hide message after 3 seconds
-            setTimeout(function() {
-                statusElement.style.display = 'none';
-            }, 3000);
-        }
-
-        function initEventSource() {
-            eventSource = new EventSource('/events');
-            
-            eventSource.onopen = function() {
-                        console.log('EventSource connection established');
-                        updateConnectionStatus(true);
-                        // Get current baseline delay when page loads
-                        getCurrentBaselineDelay();
-                    };
-                    
-                    eventSource.onmessage = function(event) {
-                        try {
-                            const data = JSON.parse(event.data);
-                            updateDeviceDisplay(data);
-                            updateLastUpdateTime();
-                        } catch (e) {
-                            console.error('Failed to parse EventSource message:', e);
-                        }
-                    };
-                    
-                    eventSource.onerror = function(error) {
-                        console.error('EventSource error:', error);
-                        updateConnectionStatus(false);
-                        // Try to reconnect
-                        setTimeout(initEventSource, 3000);
-                    };        }
-
-        function updateConnectionStatus(connected) {
-            var statusElement = document.getElementById('connectionStatus');
-            if (connected) {
-                statusElement.textContent = 'Connected';
-                statusElement.className = 'connection-status connected';
-            } else {
-                statusElement.textContent = 'Disconnected';
-                statusElement.className = 'connection-status disconnected';
-            }
-        }
-
-        function updateLastUpdateTime() {
-            var now = new Date();
-            var timeString = now.toLocaleTimeString();
-            document.getElementById('lastUpdate').textContent = timeString;
-        }
-
-        function createDeviceCard(deviceId) {
-            var card = document.createElement('div');
-            card.className = 'device-card';
-            card.id = 'device-' + deviceId;
-            
-            card.innerHTML = 
-                '<div class="device-title">Device ' + deviceId + '</div>' +
-                '<div class="input-grid" id="input-grid-' + deviceId + '">' +
-                '<!-- Input status will be dynamically generated by JavaScript -->'
-                '</div>';
-            
-            return card;
-        }
-
-        function updateDeviceDisplay(data) {
-            var container = document.getElementById('deviceContainer');
-            
-            // If first load, create all device cards
-            if (container.children.length === 0) {
-                for (var deviceId = 1; deviceId <= 4; deviceId++) {
-                    container.appendChild(createDeviceCard(deviceId));
-                }
-            }
-            
-            // Update status for each device
-            for (var deviceId = 1; deviceId <= 4; deviceId++) {
-                var deviceKey = 'device' + deviceId;
-                var inputs = data[deviceKey];
-                
-                if (inputs) {
-                    var inputGrid = document.getElementById('input-grid-' + deviceId);
-                    
-                    // If first load, create all input items
-                    if (inputGrid.children.length === 0) {
-                        for (var inputId = 1; inputId <= 48; inputId++) {
-                            var inputItem = document.createElement('div');
-                            inputItem.className = 'input-item';
-                            inputItem.innerHTML = 
-                                '<div class="input-id">' + inputId + '</div>' +
-                                '<div class="input-state" id="device-' + deviceId + '-input-' + inputId + '"></div>';
-                            inputGrid.appendChild(inputItem);
-                        }
-                    }
-                    
-                    // Update input status
-                    for (var i = 0; i < inputs.length; i++) {
-                        var input = inputs[i];
-                        var stateElement = document.getElementById('device-' + deviceId + '-input-' + input.id);
-                        if (stateElement) {
-                            if (input.state === 1) {
-                                stateElement.className = 'input-state state-active';
-                            } else {
-                                stateElement.className = 'input-state state-inactive';
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Initialize EventSource after page loads
-        window.onload = function() {
-            initEventSource();
-        };
-    </script>
-</body>
-</html>
-)END_HTML";
+    String html = "";
+    html += "<!DOCTYPE html>\n";
+    html += "<html lang=\"en\">\n";
+    html += "<head>\n";
+    html += "    <meta charset=\"UTF-8\">\n";
+    html += "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n";
+    html += "    <title>Laser Sensor Real-time Monitoring System</title>\n";
+    html += "    <style>\n";
+    html += "        body {\n";
+    html += "            font-family: Arial, sans-serif;\n";
+    html += "            margin: 0;\n";
+    html += "            padding: 20px;\n";
+    html += "            background-color: #f5f5f5;\n";
+    html += "        }\n";
+    html += "        .container {\n";
+    html += "            max-width: 1400px;\n";
+    html += "            margin: 0 auto;\n";
+    html += "            background-color: white;\n";
+    html += "            padding: 20px;\n";
+    html += "            border-radius: 8px;\n";
+    html += "            box-shadow: 0 2px 10px rgba(0,0,0,0.1);\n";
+    html += "        }\n";
+    html += "        h1 {\n";
+    html += "            text-align: center;\n";
+    html += "            color: #333;\n";
+    html += "            margin-bottom: 30px;\n";
+    html += "        }\n";
+    html += "        .control-group {\n";
+    html += "            margin-bottom: 20px;\n";
+    html += "            padding: 15px;\n";
+    html += "            background-color: #e8f4fd;\n";
+    html += "            border-radius: 4px;\n";
+    html += "        }\n";
+    html += "        .control-group label {\n";
+    html += "            display: inline-block;\n";
+    html += "            width: 150px;\n";
+    html += "            font-weight: bold;\n";
+    html += "        }\n";
+    html += "        .control-group input {\n";
+    html += "            margin-right: 10px;\n";
+    html += "            padding: 5px;\n";
+    html += "            border: 1px solid #ccc;\n";
+    html += "            border-radius: 4px;\n";
+    html += "        }\n";
+    html += "        .control-group button {\n";
+    html += "            padding: 5px 15px;\n";
+    html += "            background-color: #007bff;\n";
+    html += "            color: white;\n";
+    html += "            border: none;\n";
+    html += "            border-radius: 4px;\n";
+    html += "            cursor: pointer;\n";
+    html += "            margin-right: 10px;\n";
+    html += "        }\n";
+    html += "        .control-group button:hover {\n";
+    html += "            background-color: #0056b3;\n";
+    html += "        }\n";
+    html += "        .status-message {\n";
+    html += "            padding: 10px;\n";
+    html += "            margin: 10px 0;\n";
+    html += "            border-radius: 4px;\n";
+    html += "            display: none;\n";
+    html += "        }\n";
+    html += "        .status-message.success {\n";
+    html += "            background-color: #d4edda;\n";
+    html += "            color: #155724;\n";
+    html += "        }\n";
+    html += "        .status-message.error {\n";
+    html += "            background-color: #f8d7da;\n";
+    html += "            color: #721c24;\n";
+    html += "        }\n";
+    html += "        .device-grid {\n";
+    html += "            display: grid;\n";
+    html += "            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));\n";
+    html += "            gap: 20px;\n";
+    html += "            margin-bottom: 20px;\n";
+    html += "        }\n";
+    html += "        .device-card {\n";
+    html += "            border: 2px solid #ddd;\n";
+    html += "            border-radius: 8px;\n";
+    html += "            padding: 15px;\n";
+    html += "            background-color: #fafafa;\n";
+    html += "        }\n";
+    html += "        .device-title {\n";
+    html += "            font-size: 18px;\n";
+    html += "            font-weight: bold;\n";
+    html += "            margin-bottom: 15px;\n";
+    html += "            color: #555;\n";
+    html += "            text-align: center;\n";
+    html += "        }\n";
+    html += "        .input-grid {\n";
+    html += "            display: grid;\n";
+    html += "            grid-template-columns: repeat(8, 1fr);\n";
+    html += "            gap: 3px;\n";
+    html += "        }\n";
+    html += "        .input-item {\n";
+    html += "            display: flex;\n";
+    html += "            flex-direction: column;\n";
+    html += "            align-items: center;\n";
+    html += "            padding: 3px;\n";
+    html += "            border-radius: 4px;\n";
+    html += "            font-size: 10px;\n";
+    html += "        }\n";
+    html += "        .input-id {\n";
+    html += "            font-weight: bold;\n";
+    html += "            margin-bottom: 2px;\n";
+    html += "        }\n";
+    html += "        .input-state {\n";
+    html += "            width: 20px;\n";
+    html += "            height: 20px;\n";
+    html += "            border-radius: 50%;\n";
+    html += "            border: 1px solid #ccc;\n";
+    html += "        }\n";
+    html += "        .state-active {\n";
+    html += "            background-color: #ff4444;\n";
+    html += "            border-color: #cc0000;\n";
+    html += "        }\n";
+    html += "        .state-inactive {\n";
+    html += "            background-color: #cccccc;\n";
+    html += "        }\n";
+    html += "        .status-bar {\n";
+    html += "            text-align: center;\n";
+    html += "            padding: 10px;\n";
+    html += "            background-color: #e8f4fd;\n";
+    html += "            border-radius: 4px;\n";
+    html += "            margin-bottom: 20px;\n";
+    html += "        }\n";
+    html += "        .connection-status {\n";
+    html += "            display: inline-block;\n";
+    html += "            padding: 5px 10px;\n";
+    html += "            border-radius: 4px;\n";
+    html += "            font-weight: bold;\n";
+    html += "        }\n";
+    html += "        .connected {\n";
+    html += "            background-color: #d4edda;\n";
+    html += "            color: #155724;\n";
+    html += "        }\n";
+    html += "        .disconnected {\n";
+    html += "            background-color: #f8d7da;\n";
+    html += "            color: #721c24;\n";
+    html += "        }\n";
+    html += "    </style>\n";
+    html += "</head>\n";
+    html += "<body>\n";
+    html += "    <div class=\"container\">\n";
+    html += "        <h1>Laser Sensor Real-time Monitoring System</h1>\n";
+    html += "        \n";
+    html += "        <div class=\"control-group\">\n";
+    html += "            <h3>Baseline Settings Control</h3>\n";
+    html += "            <label>Baseline Delay (ms):</label>\n";
+    html += "            <input type=\"number\" id=\"baselineDelay\" min=\"0\" max=\"5000\" step=\"50\" value=\"200\">\n";
+    html += "            <button onclick=\"setBaselineDelay()\">Set Delay</button>\n";
+    html += "            <button onclick=\"getCurrentBaselineDelay()\">Get Current</button>\n";
+    html += "        </div>\n";
+    html += "        \n";
+    html += "        <div id=\"statusMessage\" class=\"status-message\"></div>\n";
+    html += "\n";
+    html += "        <div class=\"status-bar\">\n";
+    html += "            <span>Connection Status: </span>\n";
+    html += "            <span id=\"connectionStatus\" class=\"connection-status disconnected\">Disconnected</span>\n";
+    html += "            <span style=\"margin-left: 20px;\">Last Update: </span>\n";
+    html += "            <span id=\"lastUpdate\">--:--:--</span>\n";
+    html += "        </div>\n";
+    html += "\n";
+    html += "        <div class=\"device-grid\" id=\"deviceContainer\">\n";
+    html += "            <!-- Device cards will be dynamically generated by JavaScript -->\n";
+    html += "        </div>\n";
+    html += "    </div>\n";
+    html += "\n";
+    html += "    <script>\n";
+    html += "        var eventSource;\n";
+    html += "        var deviceData = {};\n";
+    html += "\n";
+    html += "        function setBaselineDelay() {\n";
+    html += "            var delay = document.getElementById('baselineDelay').value;\n";
+    html += "            \n";
+    html += "            fetch('/api/baselineDelay', {\n";
+    html += "                method: 'POST',\n";
+    html += "                headers: {\n";
+    html += "                    'Content-Type': 'application/json',\n";
+    html += "                },\n";
+    html += "                body: JSON.stringify({ delay: parseInt(delay) })\n";
+    html += "            })\n";
+    html += "            .then(response => response.json())\n";
+    html += "            .then(data => {\n";
+    html += "                showStatusMessage('Baseline delay set to ' + delay + 'ms', 'success');\n";
+    html += "            })\n";
+    html += "            .catch(error => {\n";
+    html += "                console.error('Failed to set baseline delay:', error);\n";
+    html += "                showStatusMessage('Failed to set baseline delay', 'error');\n";
+    html += "            });\n";
+    html += "        }\n";
+    html += "\n";
+    html += "        function getCurrentBaselineDelay() {\n";
+    html += "            fetch('/api/baselineDelay')\n";
+    html += "            .then(response => response.json())\n";
+    html += "            .then(data => {\n";
+    html += "                document.getElementById('baselineDelay').value = data.delay;\n";
+    html += "                showStatusMessage('Current baseline delay: ' + data.delay + 'ms', 'success');\n";
+    html += "            })\n";
+    html += "            .catch(error => {\n";
+    html += "                console.error('Failed to get baseline delay:', error);\n";
+    html += "                showStatusMessage('Failed to get baseline delay', 'error');\n";
+    html += "            });\n";
+    html += "        }\n";
+    html += "\n";
+    html += "        function showStatusMessage(message, type) {\n";
+    html += "            var statusElement = document.getElementById('statusMessage');\n";
+    html += "            statusElement.textContent = message;\n";
+    html += "            statusElement.className = 'status-message ' + type;\n";
+    html += "            statusElement.style.display = 'block';\n";
+    html += "            \n";
+    html += "            // Auto hide message after 3 seconds\n";
+    html += "            setTimeout(function() {\n";
+    html += "                statusElement.style.display = 'none';\n";
+    html += "            }, 3000);\n";
+    html += "        }\n";
+    html += "\n";
+    html += "        function initEventSource() {\n";
+    html += "            eventSource = new EventSource('/events');\n";
+    html += "            \n";
+    html += "            eventSource.onopen = function() {\n";
+    html += "                console.log('EventSource connection established');\n";
+    html += "                updateConnectionStatus(true);\n";
+    html += "                // Get current baseline delay when page loads\n";
+    html += "                getCurrentBaselineDelay();\n";
+    html += "            };\n";
+    html += "            \n";
+    html += "            eventSource.onmessage = function(event) {\n";
+    html += "                try {\n";
+    html += "                    var data = JSON.parse(event.data);\n";
+    html += "                    updateDeviceDisplay(data);\n";
+    html += "                    updateLastUpdateTime();\n";
+    html += "                } catch (e) {\n";
+    html += "                    console.error('Failed to parse EventSource message:', e);\n";
+    html += "                }\n";
+    html += "            };\n";
+    html += "            \n";
+    html += "            eventSource.onerror = function(error) {\n";
+    html += "                console.error('EventSource error:', error);\n";
+    html += "                updateConnectionStatus(false);\n";
+    html += "                // Try to reconnect\n";
+    html += "                setTimeout(initEventSource, 3000);\n";
+    html += "            };\n";
+    html += "        }\n";
+    html += "\n";
+    html += "        function updateConnectionStatus(connected) {\n";
+    html += "            var statusElement = document.getElementById('connectionStatus');\n";
+    html += "            if (connected) {\n";
+    html += "                statusElement.textContent = 'Connected';\n";
+    html += "                statusElement.className = 'connection-status connected';\n";
+    html += "            } else {\n";
+    html += "                statusElement.textContent = 'Disconnected';\n";
+    html += "                statusElement.className = 'connection-status disconnected';\n";
+    html += "            }\n";
+    html += "        }\n";
+    html += "\n";
+    html += "        function updateLastUpdateTime() {\n";
+    html += "            var now = new Date();\n";
+    html += "            var timeString = now.toLocaleTimeString();\n";
+    html += "            document.getElementById('lastUpdate').textContent = timeString;\n";
+    html += "        }\n";
+    html += "\n";
+    html += "        function createDeviceCard(deviceId) {\n";
+    html += "            var card = document.createElement('div');\n";
+    html += "            card.className = 'device-card';\n";
+    html += "            card.id = 'device-' + deviceId;\n";
+    html += "            \n";
+    html += "            card.innerHTML = \n";
+    html += "                '<div class=\"device-title\">Device ' + deviceId + '</div>' +\n";
+    html += "                '<div class=\"input-grid\" id=\"input-grid-' + deviceId + '\">' +\n";
+    html += "                '<!-- Input status will be dynamically generated by JavaScript -->' +\n";
+    html += "                '</div>';\n";
+    html += "            \n";
+    html += "            return card;\n";
+    html += "        }\n";
+    html += "\n";
+    html += "        function updateDeviceDisplay(data) {\n";
+    html += "            var container = document.getElementById('deviceContainer');\n";
+    html += "            \n";
+    html += "            // If first load, create all device cards\n";
+    html += "            if (container.children.length === 0) {\n";
+    html += "                for (var deviceId = 1; deviceId <= 4; deviceId++) {\n";
+    html += "                    container.appendChild(createDeviceCard(deviceId));\n";
+    html += "                }\n";
+    html += "            }\n";
+    html += "            \n";
+    html += "            // Update status for each device\n";
+    html += "            for (var deviceId = 1; deviceId <= 4; deviceId++) {\n";
+    html += "                var deviceKey = 'device' + deviceId;\n";
+    html += "                var inputs = data[deviceKey];\n";
+    html += "                \n";
+    html += "                if (inputs) {\n";
+    html += "                    var inputGrid = document.getElementById('input-grid-' + deviceId);\n";
+    html += "                    \n";
+    html += "                    // If first load, create all input items\n";
+    html += "                    if (inputGrid.children.length === 0) {\n";
+    html += "                        for (var inputId = 1; inputId <= 48; inputId++) {\n";
+    html += "                            var inputItem = document.createElement('div');\n";
+    html += "                            inputItem.className = 'input-item';\n";
+    html += "                            inputItem.innerHTML = \n";
+    html += "                                '<div class=\"input-id\">' + inputId + '</div>' +\n";
+    html += "                                '<div class=\"input-state\" id=\"device-' + deviceId + '-input-' + inputId + '\"></div>';\n";
+    html += "                            inputGrid.appendChild(inputItem);\n";
+    html += "                        }\n";
+    html += "                    }\n";
+    html += "                    \n";
+    html += "                    // Update input status\n";
+    html += "                    for (var i = 0; i < inputs.length; i++) {\n";
+    html += "                        var input = inputs[i];\n";
+    html += "                        var stateElement = document.getElementById('device-' + deviceId + '-input-' + input.id);\n";
+    html += "                        if (stateElement) {\n";
+    html += "                            if (input.state === 1) {\n";
+    html += "                                stateElement.className = 'input-state state-active';\n";
+    html += "                            } else {\n";
+    html += "                                stateElement.className = 'input-state state-inactive';\n";
+    html += "                            }\n";
+    html += "                        }\n";
+    html += "                    }\n";
+    html += "                }\n";
+    html += "            }\n";
+    html += "        }\n";
+    html += "\n";
+    html += "        // Initialize EventSource after page loads\n";
+    html += "        window.onload = function() {\n";
+    html += "            initEventSource();\n";
+    html += "        };\n";
+    html += "    </script>\n";
+    html += "</body>\n";
+    html += "</html>\n";
+    return html;
 }
 
 void LaserWebServer::setBaselineDelay(unsigned long delay) {
