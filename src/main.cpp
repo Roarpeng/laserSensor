@@ -84,7 +84,9 @@ int currentDevice = 1;
 unsigned long baselineSetTime = 0;
 unsigned long lastBaselineCheck = 0;
 uint8_t baseline[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
-unsigned long baselineDelay = 200; // 基线设置延迟时间(毫秒)，可通过WebUI调整
+unsigned long baselineDelay = 200; // 基线设置延迟时间(毫秒)，可通过串口/WebUI调整
+unsigned long scanInterval = 200; // 扫描周期(毫秒)，可通过串口调整
+unsigned long baselineStableTime = 500; // 基线稳定时间(毫秒)，建立基线后等待此时间再开始检测
 bool triggerSent = false; // 标记是否已发送触发消息
 
 void setup_wifi() {
@@ -172,14 +174,17 @@ void reconnect() {
         if (client.connect(mqtt_client_id)) {
             Serial.println("connected");
 
-            // 检查订阅结果并打印详细信息
-            bool sub1 = client.subscribe(mqtt_topic);
-            bool sub2 = client.subscribe(changeState_topic);
-            bool sub3 = client.subscribe(btn_resetAll_topic);
+            // 检查订阅结果并打印详细信息（使用 QoS 1）
+            bool sub1 = client.subscribe(mqtt_topic, 1);
+            bool sub2 = client.subscribe(changeState_topic, 1);
+            bool sub3 = client.subscribe(btn_resetAll_topic, 1);
+            // 临时：订阅所有主题用于调试
+            bool sub4 = client.subscribe("#", 1);
 
-            Serial.printf("Subscriptions: receiver/triggered=%d, changeState=%d, btn/resetAll=%d\n",
-                          sub1, sub2, sub3);
-            Serial.printf("Listening for topic: '%s'\n", changeState_topic);
+            Serial.printf("Subscriptions: receiver/triggered=%d, changeState=%d, btn/resetAll=%d, wildcard=#=%d\n",
+                          sub1, sub2, sub3, sub4);
+            Serial.printf("Listening for topic: '%s' (with QoS 1)\n", changeState_topic);
+            Serial.printf("MQTT buffer size: %d bytes\n", client.getBufferSize());
         } else {
             Serial.print("failed, rc=");
             Serial.print(client.state());
@@ -273,9 +278,9 @@ void setBaseline() {
             delay(20);  // 20ms 延迟让设备有时间处理
         }
     }
-    Serial.println("Baseline setup completed, entering BASELINE_ACTIVE state");
+    Serial.printf("Baseline setup completed, waiting %lu ms for stabilization...\n", baselineStableTime);
     currentState = BASELINE_ACTIVE;
-    lastBaselineCheck = millis();
+    lastBaselineCheck = millis() + baselineStableTime; // 延迟开始检测，等待基线稳定
 }
 
 bool checkForChanges() {
@@ -316,6 +321,76 @@ void handleTriggerDetected() {
     // 不改变状态，继续监控等待下一个 changeState
 }
 
+// 串口命令处理函数
+void handleSerialCommands() {
+    if (Serial.available() > 0) {
+        String command = Serial.readStringUntil('\n');
+        command.trim(); // 去除首尾空白字符
+
+        if (command.startsWith("bd=")) {
+            // 设置基线延迟: bd=500
+            unsigned long newDelay = command.substring(3).toInt();
+            if (newDelay >= 0 && newDelay <= 5000) {
+                baselineDelay = newDelay;
+                webServer.setBaselineDelay(baselineDelay);
+                Serial.printf("✓ Baseline delay set to %lu ms\n", baselineDelay);
+            } else {
+                Serial.println("✗ Invalid value. Range: 0-5000 ms");
+            }
+        }
+        else if (command.startsWith("si=")) {
+            // 设置扫描周期: si=300
+            unsigned long newInterval = command.substring(3).toInt();
+            if (newInterval >= 100 && newInterval <= 2000) {
+                scanInterval = newInterval;
+                Serial.printf("✓ Scan interval set to %lu ms\n", scanInterval);
+            } else {
+                Serial.println("✗ Invalid value. Range: 100-2000 ms");
+            }
+        }
+        else if (command.startsWith("st=")) {
+            // 设置基线稳定时间: st=1000
+            unsigned long newStableTime = command.substring(3).toInt();
+            if (newStableTime >= 0 && newStableTime <= 5000) {
+                baselineStableTime = newStableTime;
+                Serial.printf("✓ Baseline stable time set to %lu ms\n", baselineStableTime);
+            } else {
+                Serial.println("✗ Invalid value. Range: 0-5000 ms");
+            }
+        }
+        else if (command == "status" || command == "s") {
+            // 显示当前配置
+            Serial.println("\n========== System Configuration ==========");
+            Serial.printf("Baseline Delay (bd):      %lu ms\n", baselineDelay);
+            Serial.printf("Scan Interval (si):       %lu ms\n", scanInterval);
+            Serial.printf("Baseline Stable Time (st): %lu ms\n", baselineStableTime);
+            Serial.printf("Current State:            %d (0=IDLE, 1=ACTIVE, 2=BASELINE_WAITING, 3=BASELINE_ACTIVE)\n", currentState);
+            Serial.printf("MQTT Connected:           %s\n", client.connected() ? "Yes" : "No");
+            Serial.printf("Trigger Sent:             %s\n", triggerSent ? "Yes" : "No");
+            Serial.println("==========================================\n");
+        }
+        else if (command == "help" || command == "h") {
+            // 显示帮助信息
+            Serial.println("\n========== Serial Commands ==========");
+            Serial.println("bd=<value>  Set baseline delay (0-5000 ms)");
+            Serial.println("            Example: bd=500");
+            Serial.println();
+            Serial.println("si=<value>  Set scan interval (100-2000 ms)");
+            Serial.println("            Example: si=300");
+            Serial.println();
+            Serial.println("st=<value>  Set baseline stable time (0-5000 ms)");
+            Serial.println("            Example: st=1000");
+            Serial.println();
+            Serial.println("status, s   Show current configuration");
+            Serial.println("help, h     Show this help message");
+            Serial.println("=====================================\n");
+        }
+        else if (command.length() > 0) {
+            Serial.printf("✗ Unknown command: '%s'. Type 'help' for available commands.\n", command.c_str());
+        }
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     rs485Serial.begin(BAUD_RATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
@@ -329,6 +404,7 @@ void setup() {
     setup_wifi();
     client.setServer(mqtt_server, 1883);
     client.setCallback(callback);
+    client.setBufferSize(1024); // 增加 MQTT 缓冲区到 512 字节（默认 256）
     client.setKeepAlive(60); // 设置 keepalive 为60秒
     client.setSocketTimeout(15); // 设置 socket 超时为15秒
 
@@ -354,6 +430,7 @@ void setup() {
     // 初始化系统状态为 IDLE（等待 btn/resetAll 激活）
     currentState = IDLE;
     Serial.println("System initialized in IDLE state, waiting for btn/resetAll...");
+    Serial.println("Type 'help' for serial commands");
 }
 
 void loop() {
@@ -365,6 +442,9 @@ void loop() {
     if (client.connected()) {
         client.loop();
     }
+
+    // 处理串口命令
+    handleSerialCommands();
 
     // 处理Web客户端请求（修复WebUI无法访问问题）
     webServer.handleClient();
@@ -416,8 +496,8 @@ void loop() {
             break;
 
         case BASELINE_ACTIVE:
-            // 基线监控模式：每200ms检测与基线的差异（考虑到设备间延迟）
-            if (currentTime - lastBaselineCheck >= 200) {
+            // 基线监控模式：根据 scanInterval 检测与基线的差异
+            if (currentTime - lastBaselineCheck >= scanInterval) {
                 lastBaselineCheck = currentTime;
                 if (checkForChanges()) {
                     Serial.println("Baseline deviation detected");
