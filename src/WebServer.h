@@ -12,6 +12,7 @@ class LaserWebServer {
 private:
     WiFiServer server;
     WiFiClient clients[4]; // 支持最多4个客户端
+    bool isSSEClient[4]; // 标记哪些是 SSE 长连接
     uint8_t deviceStates[4][48]; // 存储所有设备的状态
     unsigned long lastUpdateTime;
     bool isWebServerRunning;
@@ -27,7 +28,7 @@ public:
     void broadcastStates();
     String getHTMLPage();
     String getDeviceStatesJSON();
-    void handleHTTPRequest(WiFiClient& client);
+    void handleHTTPRequest(WiFiClient& client, int slotIndex);
     String getHTTPResponse(const String& contentType, const String& content);
     void sendWebSocketUpdate(WiFiClient& client, const String& data);
     void setBaselineDelay(unsigned long delay);

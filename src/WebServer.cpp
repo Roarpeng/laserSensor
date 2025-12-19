@@ -6,12 +6,13 @@ LaserWebServer::LaserWebServer() : server(80) {
     isWebServerRunning = false;
     clientCount = 0;
     baselineDelay = 200; // 默认200ms延迟
-    
+
     // 初始化所有设备状态为0
     for(int i = 0; i < 4; i++) {
         for(int j = 0; j < 48; j++) {
             deviceStates[i][j] = 0;
         }
+        isSSEClient[i] = false; // 初始化 SSE 标记
     }
 }
 
@@ -24,41 +25,60 @@ void LaserWebServer::begin() {
 }
 
 void LaserWebServer::handleClient() {
-    // 处理现有客户端
+    // 清理断开的客户端
     for(int i = 0; i < 4; i++) {
-        if(clients[i].connected()) {
-            if(clients[i].available()) {
-                handleHTTPRequest(clients[i]);
+        if(clients[i]) {
+            if(!clients[i].connected()) {
+                Serial.printf("Client %d disconnected\n", i);
+                clients[i].stop();
+                isSSEClient[i] = false;
+                if(clientCount > 0) clientCount--;
+            } else if(clients[i].available() && !isSSEClient[i]) {
+                // 只处理非 SSE 客户端的新请求
+                handleHTTPRequest(clients[i], i);
             }
-        } else if (clients[i]) {
-            // 如果客户端断开连接，清理槽位
-            clients[i].stop();
         }
     }
 
     // 检查新客户端连接
     WiFiClient newClient = server.available();
     if (newClient) {
-        Serial.println("New client connected");
-
         // 找到空槽位
-        bool clientStored = false;
+        int freeSlot = -1;
         for(int i = 0; i < 4; i++) {
-            if(!clients[i].connected()) {
-                clients[i] = newClient;
-                clientCount++;
-                clientStored = true;
-                Serial.printf("Client stored in slot %d\n", i);
+            if(!clients[i] || !clients[i].connected()) {
+                freeSlot = i;
                 break;
             }
         }
-        if (!clientStored) {
-            // 没有可用插槽，拒绝连接
-            Serial.println("No free slots for new client, disconnecting.");
+
+        if (freeSlot >= 0) {
+            // 打印客户端 IP 地址用于调试
+            IPAddress clientIP = newClient.remoteIP();
+            Serial.printf("New client connected from %s, stored in slot %d\n", clientIP.toString().c_str(), freeSlot);
+            clients[freeSlot] = newClient;
+            isSSEClient[freeSlot] = false;
+            clientCount++;
+        } else {
+            // 限流：只每5秒打印一次"No free slots"警告
+            static unsigned long lastNoSlotWarning = 0;
+            unsigned long currentTime = millis();
+            if (currentTime - lastNoSlotWarning > 5000) {
+                Serial.println("No free slots available:");
+                for(int i = 0; i < 4; i++) {
+                    if(clients[i].connected()) {
+                        Serial.printf("  Slot %d: connected=%d, SSE=%d, IP=%s\n",
+                            i,
+                            clients[i].connected(),
+                            isSSEClient[i],
+                            clients[i].remoteIP().toString().c_str());
+                    }
+                }
+                lastNoSlotWarning = currentTime;
+            }
             newClient.stop();
         }
     }
-    // 注意：广播由 main.cpp 的 loop() 统一管理，这里不再重复广播
 }
 
 void LaserWebServer::updateDeviceState(uint8_t deviceAddr, uint8_t inputNum, bool state) {
@@ -78,8 +98,20 @@ void LaserWebServer::updateAllDeviceStates(uint8_t deviceAddr, uint8_t* states) 
 void LaserWebServer::broadcastStates() {
     String json = getDeviceStatesJSON();
     for(int i = 0; i < 4; i++) {
-        if(clients[i].connected()) {
-            sendWebSocketUpdate(clients[i], json);
+        if(clients[i].connected() && isSSEClient[i]) {
+            // 尝试发送数据
+            size_t written = clients[i].print("data: ");
+            if(written == 0) {
+                // 写入失败，连接可能已断开
+                Serial.printf("Failed to write to SSE client on slot %d, closing connection\n", i);
+                clients[i].stop();
+                isSSEClient[i] = false;
+                if(clientCount > 0) clientCount--;
+                continue;
+            }
+            clients[i].print(json);
+            clients[i].print("\n\n");
+            clients[i].flush();
         }
     }
 }
@@ -117,37 +149,45 @@ String LaserWebServer::getHTTPResponse(const String& contentType, const String& 
 }
 
 void LaserWebServer::sendWebSocketUpdate(WiFiClient& client, const String& data) {
-    // 简单的WebSocket-like更新（通过HTTP长轮询模拟）
+    // SSE 格式: "data: " + JSON + "\n\n"
     if(client.connected()) {
-        client.print("data: " + data + "\n\n");
+        client.print("data: ");
+        client.print(data);
+        client.print("\n\n");
+        client.flush(); // 确保数据立即发送
     }
 }
 
-void LaserWebServer::handleHTTPRequest(WiFiClient& client) {
+void LaserWebServer::handleHTTPRequest(WiFiClient& client, int slotIndex) {
     String request = "";
     while(client.available()) {
         request += client.readStringUntil('\r');
     }
-    
+
     // 解析HTTP请求
     if(request.indexOf("GET / ") >= 0 || request.indexOf("GET /index.html") >= 0) {
         // 主页面请求
         String html = getHTMLPage();
         client.print(getHTTPResponse("text/html", html));
+        client.stop(); // 立即关闭连接
+        isSSEClient[slotIndex] = false;
     }
     else if(request.indexOf("GET /api/states") >= 0) {
         // API状态请求
         String json = getDeviceStatesJSON();
         client.print(getHTTPResponse("application/json", json));
+        client.stop();
+        isSSEClient[slotIndex] = false;
     }
     else if(request.indexOf("GET /api/baselineDelay") >= 0) {
         // 获取基线延迟设置
         String json = getBaselineDelayJSON();
         client.print(getHTTPResponse("application/json", json));
+        client.stop();
+        isSSEClient[slotIndex] = false;
     }
     else if(request.indexOf("POST /api/baselineDelay") >= 0) {
         // 设置基线延迟
-        // 简单解析POST请求体
         String body = "";
         bool bodyStarted = false;
         while(client.available()) {
@@ -159,22 +199,40 @@ void LaserWebServer::handleHTTPRequest(WiFiClient& client) {
                 bodyStarted = true;
             }
         }
-        
+
         // 解析JSON获取延迟值
         DynamicJsonDocument doc(256);
         if(deserializeJson(doc, body) == DeserializationError::Ok) {
             unsigned long delayValue = doc["delay"];
             setBaselineDelay(delayValue);
-            
+
             String responseJson = getBaselineDelayJSON();
             client.print(getHTTPResponse("application/json", responseJson));
         } else {
             String errorJson = "{\"error\":\"Invalid JSON\"}";
             client.print(getHTTPResponse("application/json", errorJson));
         }
+        client.stop();
+        isSSEClient[slotIndex] = false;
     }
     else if(request.indexOf("GET /events") >= 0) {
         // Server-Sent Events for real-time updates
+        IPAddress clientIP = client.remoteIP();
+
+        // 检查是否已经有来自同一 IP 的 SSE 连接
+        for(int i = 0; i < 4; i++) {
+            if(i != slotIndex && isSSEClient[i] && clients[i].connected()) {
+                if(clients[i].remoteIP() == clientIP) {
+                    Serial.printf("Closing duplicate SSE connection from %s on slot %d\n",
+                                  clientIP.toString().c_str(), i);
+                    clients[i].stop();
+                    isSSEClient[i] = false;
+                    if(clientCount > 0) clientCount--;
+                }
+            }
+        }
+
+        Serial.printf("SSE client on slot %d from %s\n", slotIndex, clientIP.toString().c_str());
         String response = "HTTP/1.1 200 OK\r\n";
         response += "Content-Type: text/event-stream\r\n";
         response += "Cache-Control: no-cache\r\n";
@@ -182,22 +240,22 @@ void LaserWebServer::handleHTTPRequest(WiFiClient& client) {
         response += "Access-Control-Allow-Origin: *\r\n";
         response += "\r\n";
         client.print(response);
+        client.flush(); // 确保 HTTP 头部发送
 
         // 发送初始数据
         String json = getDeviceStatesJSON();
         sendWebSocketUpdate(client, json);
 
-        // SSE 连接不关闭，保持连接用于持续推送
-        return;
+        // 标记为 SSE 长连接，不关闭
+        isSSEClient[slotIndex] = true;
     }
     else {
         // 404错误
         String notFound = "<html><body><h1>404 Not Found</h1></body></html>";
         client.print(getHTTPResponse("text/html", notFound));
+        client.stop();
+        isSSEClient[slotIndex] = false;
     }
-
-    // 非SSE连接立即关闭
-    client.stop();
 }
 
 String LaserWebServer::getHTMLPage() {
@@ -428,6 +486,12 @@ String LaserWebServer::getHTMLPage() {
     html += "        }\n";
     html += "\n";
     html += "        function initEventSource() {\n";
+    html += "            // 关闭已存在的连接\n";
+    html += "            if (eventSource) {\n";
+    html += "                console.log('Closing existing EventSource');\n";
+    html += "                eventSource.close();\n";
+    html += "            }\n";
+    html += "            \n";
     html += "            eventSource = new EventSource('/events');\n";
     html += "            \n";
     html += "            eventSource.onopen = function() {\n";
@@ -450,7 +514,8 @@ String LaserWebServer::getHTMLPage() {
     html += "            eventSource.onerror = function(error) {\n";
     html += "                console.error('EventSource error:', error);\n";
     html += "                updateConnectionStatus(false);\n";
-    html += "                // Try to reconnect\n";
+    html += "                eventSource.close(); // 明确关闭失败的连接\n";
+    html += "                // 3秒后重新连接\n";
     html += "                setTimeout(initEventSource, 3000);\n";
     html += "            };\n";
     html += "        }\n";

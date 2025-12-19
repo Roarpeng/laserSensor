@@ -108,13 +108,28 @@ void setup_wifi() {
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
+    Serial.printf("MQTT recv: topic=[%s]\n", topic);
     Serial.print("Message arrived [");
     Serial.print(topic);
     Serial.print("] ");
-    for (int i = 0; i < length; i++) {
+
+    // 打印 payload（限制在前100个字符）
+    int printLen = length > 100 ? 100 : length;
+    for (int i = 0; i < printLen; i++) {
         Serial.print((char)payload[i]);
     }
+    if (length > 100) {
+        Serial.print("...");
+    }
     Serial.println();
+
+    // 调试：打印主题和payload详情
+    Serial.printf("Topic debug: len=%d, topic='%s'\n", strlen(topic), topic);
+    Serial.printf("Payload length: %d bytes\n", length);
+    Serial.printf("Comparing with changeState_topic='%s' (len=%d)\n",
+                  changeState_topic, strlen(changeState_topic));
+    Serial.printf("Current system state: %d (0=IDLE, 1=ACTIVE, 2=BASELINE_WAITING, 3=BASELINE_ACTIVE)\n",
+                  currentState);
 
     // 处理 btn/resetAll 主题 - 激活系统
     if (strcmp(topic, btn_resetAll_topic) == 0) {
@@ -129,12 +144,20 @@ void callback(char* topic, byte* payload, unsigned int length) {
             Serial.println("System is IDLE, ignoring changeState message");
             return;
         }
-        Serial.printf("changeState received, will set baseline after %lu ms delay...\n", baselineDelay);
+
+        Serial.printf("changeState received with %d bytes payload\n", length);
+
+        // TODO: 解析 JSON payload 并使用其中的状态数据
+        // 当前实现：忽略 payload，延迟后读取传感器状态作为基线
+        Serial.printf("Will set baseline after %lu ms delay by reading sensors...\n", baselineDelay);
         currentState = BASELINE_WAITING;
         baselineSetTime = millis() + baselineDelay;
         triggerSent = false; // 重置触发标志，允许下一次触发
         return;
     }
+
+    // 如果没有匹配任何主题，打印警告
+    Serial.println("WARNING: Topic not handled!");
 }
 
 void reconnect() {
@@ -148,9 +171,15 @@ void reconnect() {
 
         if (client.connect(mqtt_client_id)) {
             Serial.println("connected");
-            client.subscribe(mqtt_topic);
-            client.subscribe(changeState_topic);
-            client.subscribe(btn_resetAll_topic);
+
+            // 检查订阅结果并打印详细信息
+            bool sub1 = client.subscribe(mqtt_topic);
+            bool sub2 = client.subscribe(changeState_topic);
+            bool sub3 = client.subscribe(btn_resetAll_topic);
+
+            Serial.printf("Subscriptions: receiver/triggered=%d, changeState=%d, btn/resetAll=%d\n",
+                          sub1, sub2, sub3);
+            Serial.printf("Listening for topic: '%s'\n", changeState_topic);
         } else {
             Serial.print("failed, rc=");
             Serial.print(client.state());
@@ -238,6 +267,11 @@ void setBaseline() {
         } else {
             Serial.printf("Baseline set for device %d\n", device);
         }
+
+        // 设备间延迟，避免 RS485 总线冲突
+        if (device < NUM_DEVICES) {
+            delay(20);  // 20ms 延迟让设备有时间处理
+        }
     }
     Serial.println("Baseline setup completed, entering BASELINE_ACTIVE state");
     currentState = BASELINE_ACTIVE;
@@ -262,6 +296,11 @@ bool checkForChanges() {
                     return true;
                 }
             }
+        }
+
+        // 设备间延迟，避免 RS485 总线冲突
+        if (device < NUM_DEVICES) {
+            delay(20);  // 20ms 延迟让设备有时间处理
         }
     }
     return false;
@@ -332,6 +371,16 @@ void loop() {
 
     unsigned long currentTime = millis();
 
+    // 定期打印系统状态（每10秒）
+    static unsigned long lastStatusReport = 0;
+    if (currentTime - lastStatusReport >= 10000) {
+        Serial.printf("Status Report - MQTT: %s, State: %d, Time: %lu\n",
+                      client.connected() ? "Connected" : "Disconnected",
+                      currentState,
+                      currentTime);
+        lastStatusReport = currentTime;
+    }
+
     // 定期广播状态到所有SSE客户端
     static unsigned long lastBroadcastTime = 0;
     if (currentTime - lastBroadcastTime >= 1000) {
@@ -367,8 +416,8 @@ void loop() {
             break;
 
         case BASELINE_ACTIVE:
-            // 基线监控模式：每100ms检测与基线的差异
-            if (currentTime - lastBaselineCheck >= 100) {
+            // 基线监控模式：每200ms检测与基线的差异（考虑到设备间延迟）
+            if (currentTime - lastBaselineCheck >= 200) {
                 lastBaselineCheck = currentTime;
                 if (checkForChanges()) {
                     Serial.println("Baseline deviation detected");
