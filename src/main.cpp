@@ -31,6 +31,10 @@ enum SystemState {
     IDLE,              // 初始状态：等待 btn/resetAll 激活
     ACTIVE,            // 激活状态：等待 changeState 设置基线
     BASELINE_WAITING,  // 等待基线延迟
+    BASELINE_INIT_0,   // 第一次基线扫描
+    BASELINE_INIT_1,   // 第二次基线扫描
+    BASELINE_INIT_2,   // 第三次基线扫描
+    BASELINE_CALC,     // 计算最终基线
     BASELINE_ACTIVE    // 基线监控中：检测与基线的差异
 };
 SystemState currentState = IDLE;
@@ -84,6 +88,10 @@ int currentDevice = 1;
 unsigned long baselineSetTime = 0;
 unsigned long lastBaselineCheck = 0;
 uint8_t baseline[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
+uint8_t init_0[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];  // 第一次扫描结果
+uint8_t init_1[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];  // 第二次扫描结果
+uint8_t init_2[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];  // 第三次扫描结果
+uint8_t baselineScanCount = 0;  // 基线扫描计数器
 unsigned long baselineDelay = 200; // 基线设置延迟时间(毫秒)，可通过串口/WebUI调整
 unsigned long scanInterval = 200; // 扫描周期(毫秒)，可通过串口调整
 unsigned long baselineStableTime = 500; // 基线稳定时间(毫秒)，建立基线后等待此时间再开始检测
@@ -154,6 +162,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
         Serial.printf("Will set baseline after %lu ms delay by reading sensors...\n", baselineDelay);
         currentState = BASELINE_WAITING;
         baselineSetTime = millis() + baselineDelay;
+        baselineScanCount = 0;  // 重置扫描计数器
         triggerSent = false; // 重置触发标志，允许下一次触发
         return;
     }
@@ -262,6 +271,67 @@ bool readInputStatus(uint8_t deviceAddress, uint8_t* status_array) {
     return false;
 }
 
+// 执行一次基线扫描并存储到指定的数组
+void scanBaseline(uint8_t targetArray[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
+    Serial.println("Scanning baseline state...");
+    for (int device = 1; device <= NUM_DEVICES; device++) {
+        bool readSuccess = readInputStatus(device, targetArray[device - 1]);
+        if (!readSuccess) {
+            Serial.printf("Failed to read device %d for baseline scan\n", device);
+            // 失败时保持之前的值
+        } else {
+            Serial.printf("Baseline scan completed for device %d\n", device);
+        }
+
+        // 设备间延迟，避免 RS485 总线冲突
+        if (device < NUM_DEVICES) {
+            delay(20);  // 20ms 延迟让设备有时间处理
+        }
+    }
+}
+
+// 添加基线掩码数组，用于标记哪些位应该参与后续比较
+uint8_t baselineMask[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
+
+void calculateFinalBaseline() {
+    Serial.println("Calculating final baseline from 3 scans...");
+    for (int device = 1; device <= NUM_DEVICES; device++) {
+        for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+            // 计算该位在三次扫描中为真的次数
+            int trueCount = init_0[device - 1][i] + init_1[device - 1][i] + init_2[device - 1][i];
+            
+            // 只有三次都为真的位，才设置到基线中并启用掩码
+            if (trueCount == 3) {
+                baseline[device - 1][i] = 1;
+                baselineMask[device - 1][i] = 1;  // 启用该位的比较
+            } else {
+                baseline[device - 1][i] = 0;  // 基线中的该位设为0
+                baselineMask[device - 1][i] = 0;  // 禁用该位的比较
+            }
+        }
+    }
+    
+    // 输出基线计算结果用于调试
+    Serial.println("Final baseline calculated:");
+    for (int device = 1; device <= NUM_DEVICES; device++) {
+        Serial.printf("Device %d baseline: ", device);
+        for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+            Serial.print(baseline[device - 1][i]);
+        }
+        Serial.println();
+        
+        Serial.printf("Device %d mask:   ", device);
+        for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+            Serial.print(baselineMask[device - 1][i]);
+        }
+        Serial.println();
+    }
+    
+    Serial.printf("Baseline calculation completed, waiting %lu ms for stabilization...\n", baselineStableTime);
+    currentState = BASELINE_ACTIVE;
+    lastBaselineCheck = millis() + baselineStableTime; // 延迟开始检测，等待基线稳定
+}
+
 void setBaseline() {
     Serial.println("Setting baseline state...");
     for (int device = 1; device <= NUM_DEVICES; device++) {
@@ -294,11 +364,13 @@ bool checkForChanges() {
             // 更新Web服务器的设备状态
             webServer.updateAllDeviceStates(device, currentStatus);
 
-            // 检查是否有变化
+            // 检查是否有变化，但只对掩码为1的位进行比较
             for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
-                if (currentStatus[i] != baseline[device - 1][i]) {
-                    Serial.printf("Change detected on Device %d, Input %d\n", device, i + 1);
-                    return true;
+                if (baselineMask[device - 1][i] == 1) {  // 只有当掩码为1时才比较
+                    if (currentStatus[i] != baseline[device - 1][i]) {
+                        Serial.printf("Change detected on Device %d, Input %d\n", device, i + 1);
+                        return true;
+                    }
                 }
             }
         }
@@ -490,9 +562,43 @@ void loop() {
         case BASELINE_WAITING:
             // 等待基线延迟时间到达
             if (currentTime >= baselineSetTime) {
-                setBaseline();
-                // setBaseline() 会自动转换到 BASELINE_ACTIVE 状态
+                currentState = BASELINE_INIT_0; // 开始第一次基线扫描
+                baselineSetTime = millis() + 200; // 200ms后进行第一次扫描
             }
+            break;
+
+        case BASELINE_INIT_0:
+            // 等待第一次扫描时间到达
+            if (currentTime >= baselineSetTime) {
+                scanBaseline(init_0); // 执行第一次扫描
+                Serial.println("First baseline scan (init_0) completed");
+                currentState = BASELINE_INIT_1; // 转到第二次扫描
+                baselineSetTime = millis() + 200; // 200ms后进行第二次扫描
+            }
+            break;
+
+        case BASELINE_INIT_1:
+            // 等待第二次扫描时间到达
+            if (currentTime >= baselineSetTime) {
+                scanBaseline(init_1); // 执行第二次扫描
+                Serial.println("Second baseline scan (init_1) completed");
+                currentState = BASELINE_INIT_2; // 转到第三次扫描
+                baselineSetTime = millis() + 200; // 200ms后进行第三次扫描
+            }
+            break;
+
+        case BASELINE_INIT_2:
+            // 等待第三次扫描时间到达
+            if (currentTime >= baselineSetTime) {
+                scanBaseline(init_2); // 执行第三次扫描
+                Serial.println("Third baseline scan (init_2) completed");
+                currentState = BASELINE_CALC; // 转到基线计算阶段
+            }
+            break;
+
+        case BASELINE_CALC:
+            // 计算最终基线（三次扫描结果进行与运算）
+            calculateFinalBaseline(); // 计算并设置最终基线，自动进入BASELINE_ACTIVE状态
             break;
 
         case BASELINE_ACTIVE:
