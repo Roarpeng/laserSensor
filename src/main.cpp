@@ -655,9 +655,9 @@ void setup() {
     lastScanTime = 0;
     currentDevice = 1;
 
-    // 初始化系统状态为 IDLE（等待 btn/resetAll 激活）
-    currentState = IDLE;
-    Serial.println("System initialized in IDLE state, waiting for btn/resetAll...");
+    // 初始化系统状态为 ACTIVE（直接激活，无需等待 btn/resetAll）
+    currentState = ACTIVE;
+    Serial.println("System initialized in ACTIVE state, ready to accept changeState messages");
     Serial.println("Type 'help' for serial commands");
 }
 
