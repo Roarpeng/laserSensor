@@ -33,7 +33,6 @@ enum SystemState {
     BASELINE_WAITING,  // 等待基线延迟
     BASELINE_INIT_0,   // 第一次基线扫描
     BASELINE_INIT_1,   // 第二次基线扫描
-    BASELINE_INIT_2,   // 第三次基线扫描
     BASELINE_CALC,     // 计算最终基线
     BASELINE_ACTIVE    // 基线监控中：检测与基线的差异
 };
@@ -90,11 +89,10 @@ unsigned long lastBaselineCheck = 0;
 uint8_t baseline[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 uint8_t init_0[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];  // 第一次扫描结果
 uint8_t init_1[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];  // 第二次扫描结果
-uint8_t init_2[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];  // 第三次扫描结果
 uint8_t baselineScanCount = 0;  // 基线扫描计数器
-unsigned long baselineDelay = 200; // 基线设置延迟时间(毫秒)，可通过串口/WebUI调整
-unsigned long scanInterval = 200; // 扫描周期(毫秒)，可通过串口调整
-unsigned long baselineStableTime = 500; // 基线稳定时间(毫秒)，建立基线后等待此时间再开始检测
+unsigned long baselineDelay = 100; // 基线设置延迟时间(毫秒) 
+unsigned long scanInterval = 200; // 扫描周期(毫秒)
+unsigned long baselineStableTime = 100; // 基线稳定时间(毫秒) 
 bool triggerSent = false; // 标记是否已发送触发消息
 
 void setup_wifi() {
@@ -118,32 +116,11 @@ void setup_wifi() {
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
-    Serial.printf("MQTT recv: topic=[%s]\n", topic);
-    Serial.print("Message arrived [");
-    Serial.print(topic);
-    Serial.print("] ");
-
-    // 打印 payload（限制在前100个字符）
-    int printLen = length > 100 ? 100 : length;
-    for (int i = 0; i < printLen; i++) {
-        Serial.print((char)payload[i]);
-    }
-    if (length > 100) {
-        Serial.print("...");
-    }
-    Serial.println();
-
-    // 调试：打印主题和payload详情
-    Serial.printf("Topic debug: len=%d, topic='%s'\n", strlen(topic), topic);
-    Serial.printf("Payload length: %d bytes\n", length);
-    Serial.printf("Comparing with changeState_topic='%s' (len=%d)\n",
-                  changeState_topic, strlen(changeState_topic));
-    Serial.printf("Current system state: %d (0=IDLE, 1=ACTIVE, 2=BASELINE_WAITING, 3=BASELINE_ACTIVE)\n",
-                  currentState);
+    Serial.printf("MQTT: [%s] %d bytes\n", topic, length);
 
     // 处理 btn/resetAll 主题 - 激活系统
     if (strcmp(topic, btn_resetAll_topic) == 0) {
-        Serial.printf("btn/resetAll received, activating system to ACTIVE state\n");
+        Serial.println("✓ btn/resetAll received, activating system");
         currentState = ACTIVE;
         return;
     }
@@ -151,15 +128,23 @@ void callback(char* topic, byte* payload, unsigned int length) {
     // 处理 changeState 主题 - 设置基线
     if (strcmp(topic, changeState_topic) == 0) {
         if (currentState == IDLE) {
-            Serial.println("System is IDLE, ignoring changeState message");
+            Serial.println("⚠ System is IDLE, ignoring changeState message");
             return;
         }
 
-        Serial.printf("changeState received with %d bytes payload\n", length);
+        // 如果正在建立基线过程中，忽略新的changeState消息
+        if (currentState == BASELINE_WAITING ||
+            currentState == BASELINE_INIT_0 ||
+            currentState == BASELINE_INIT_1 ||
+            currentState == BASELINE_CALC) {
+            Serial.println("⚠ Baseline initialization in progress, ignoring changeState message");
+            return;
+        }
 
-        // TODO: 解析 JSON payload 并使用其中的状态数据
-        // 当前实现：忽略 payload，延迟后读取传感器状态作为基线
-        Serial.printf("Will set baseline after %lu ms delay by reading sensors...\n", baselineDelay);
+        Serial.println("\n╔════════════════════════════════════════════╗");
+        Serial.println("║      RECEIVED CHANGESTATE - START SCAN     ║");
+        Serial.println("╚════════════════════════════════════════════╝");
+
         currentState = BASELINE_WAITING;
         baselineSetTime = millis() + baselineDelay;
         baselineScanCount = 0;  // 重置扫描计数器
@@ -167,8 +152,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
         return;
     }
 
-    // 如果没有匹配任何主题，打印警告
-    Serial.println("WARNING: Topic not handled!");
+    // 忽略其他主题（如 receiver/changeState，这是其他设备的主题）
 }
 
 void reconnect() {
@@ -183,21 +167,15 @@ void reconnect() {
         if (client.connect(mqtt_client_id)) {
             Serial.println("connected");
 
-            // 检查订阅结果并打印详细信息（使用 QoS 1）
-            bool sub1 = client.subscribe(mqtt_topic, 1);
-            bool sub2 = client.subscribe(changeState_topic, 1);
-            bool sub3 = client.subscribe(btn_resetAll_topic, 1);
-            // 临时：订阅所有主题用于调试
-            bool sub4 = client.subscribe("#", 1);
-
-            Serial.printf("Subscriptions: receiver/triggered=%d, changeState=%d, btn/resetAll=%d, wildcard=#=%d\n",
-                          sub1, sub2, sub3, sub4);
-            Serial.printf("Listening for topic: '%s' (with QoS 1)\n", changeState_topic);
-            Serial.printf("MQTT buffer size: %d bytes\n", client.getBufferSize());
+            // 订阅主题（使用 QoS 1）
+            client.subscribe(mqtt_topic, 1);
+            client.subscribe(changeState_topic, 1);
+            client.subscribe(btn_resetAll_topic, 1);
+            Serial.println("✓ Subscribed to MQTT topics");
         } else {
             Serial.print("failed, rc=");
             Serial.print(client.state());
-            Serial.println(" will retry in 5 seconds");
+            Serial.println(" retry in 5s");
         }
     }
 }
@@ -312,9 +290,9 @@ void scanBaseline(uint8_t targetArray[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
             Serial.printf("✓ Device %d scanned successfully\n", device);
         }
 
-        // 设备间延迟，避免 RS485 总线冲突
+        // 设备间延迟，避免 RS485 总线冲突 (优化为10ms)
         if (device < NUM_DEVICES) {
-            delay(20);  // 20ms 延迟让设备有时间处理
+            delay(10);  // 10ms 延迟让设备有时间处理
         }
     }
     Serial.println(">>> Baseline scan completed");
@@ -325,10 +303,10 @@ uint8_t baselineMask[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 
 void calculateFinalBaseline() {
     Serial.println("\n╔════════════════════════════════════════════╗");
-    Serial.println("║  CALCULATING FINAL BASELINE FROM 3 SCANS  ║");
+    Serial.println("║  CALCULATING FINAL BASELINE FROM 2 SCANS  ║");
     Serial.println("╚════════════════════════════════════════════╝");
 
-    // 首先打印三次扫描的原始数据
+    // 首先打印两次扫描的原始数据
     printDeviceData("SCAN #0 (init_0)", init_0);
     int count0 = countActiveBits(init_0);
     Serial.printf("Active bits in scan #0: %d / %d\n", count0, NUM_DEVICES * NUM_INPUTS_PER_DEVICE);
@@ -337,23 +315,19 @@ void calculateFinalBaseline() {
     int count1 = countActiveBits(init_1);
     Serial.printf("Active bits in scan #1: %d / %d\n", count1, NUM_DEVICES * NUM_INPUTS_PER_DEVICE);
 
-    printDeviceData("SCAN #2 (init_2)", init_2);
-    int count2 = countActiveBits(init_2);
-    Serial.printf("Active bits in scan #2: %d / %d\n", count2, NUM_DEVICES * NUM_INPUTS_PER_DEVICE);
-
-    // 计算逻辑：只有三次都为真的位才会被设为基线
-    Serial.println("\n>>> Applying AND logic (only bits that are 1 in ALL scans)...");
+    // 计算逻辑：只有两次都为真的位才会被设为基线
+    Serial.println("\n>>> Applying AND logic (only bits that are 1 in BOTH scans)...");
 
     int totalMasked = 0; // 统计有多少位被启用
     int totalBaseline = 0; // 统计基线中有多少位为1
 
     for (int device = 1; device <= NUM_DEVICES; device++) {
         for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
-            // 计算该位在三次扫描中为真的次数
-            int trueCount = init_0[device - 1][i] + init_1[device - 1][i] + init_2[device - 1][i];
+            // 计算该位在两次扫描中为真的次数
+            int trueCount = init_0[device - 1][i] + init_1[device - 1][i];
 
-            // 只有三次都为真的位，才设置到基线中并启用掩码
-            if (trueCount == 3) {
+            // 只有两次都为真的位，才设置到基线中并启用掩码
+            if (trueCount == 2) {
                 baseline[device - 1][i] = 1;
                 baselineMask[device - 1][i] = 1;  // 启用该位的比较
                 totalMasked++;
@@ -376,13 +350,13 @@ void calculateFinalBaseline() {
     Serial.println("\n>>> Consistency Analysis:");
     Serial.printf("  - Bits lost from scan #0: %d\n", count0 - totalBaseline);
     Serial.printf("  - Bits lost from scan #1: %d\n", count1 - totalBaseline);
-    Serial.printf("  - Bits lost from scan #2: %d\n", count2 - totalBaseline);
     Serial.printf("  - Consistency rate: %.1f%%\n",
-                  (totalBaseline * 100.0) / max(max(count0, count1), count2));
+                  (totalBaseline * 100.0) / max(count0, count1));
 
     Serial.println("\n╔════════════════════════════════════════════╗");
     Serial.printf("║  BASELINE READY - Waiting %lu ms for stable  ║\n", baselineStableTime);
-    Serial.println("╚════════════════════════════════════════════╝\n");
+    Serial.println("╚════════════════════════════════════════════╝");
+    Serial.printf("\n✓ Entering BASELINE_ACTIVE monitoring mode (scanInterval=%lums)\n\n", scanInterval);
 
     currentState = BASELINE_ACTIVE;
     lastBaselineCheck = millis() + baselineStableTime; // 延迟开始检测，等待基线稳定
@@ -415,7 +389,8 @@ bool checkForChanges() {
     static unsigned long scanCount = 0; // 扫描计数器
     scanCount++;
 
-    Serial.printf("\n[Scan #%lu] Checking baseline deviations...\n", scanCount);
+    // 简短提示：每次扫描都打印（但不打印完整数据）
+    Serial.printf("[Scan #%lu] ", scanCount);
 
     uint8_t currentScan[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
     bool anyDeviceFailed = false;
@@ -430,78 +405,60 @@ bool checkForChanges() {
             webServer.updateAllDeviceStates(device, currentScan[device - 1]);
 
             // 统计该设备的活跃位
-            int deviceActiveBits = 0;
             for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
                 if (currentScan[device - 1][i] == 1) {
-                    deviceActiveBits++;
                     totalActiveBits++;
                 }
             }
-            Serial.printf("  Device %d: %d active bits\n", device, deviceActiveBits);
         } else {
-            Serial.printf("  !!! Device %d: READ FAILED\n", device);
+            Serial.printf("⚠ Device %d read failed\n", device);
             anyDeviceFailed = true;
         }
 
-        // 设备间延迟，避免 RS485 总线冲突
+        // 设备间延迟，避免 RS485 总线冲突 (优化为10ms)
         if (device < NUM_DEVICES) {
-            delay(20);  // 20ms 延迟让设备有时间处理
+            delay(10);
         }
     }
 
     // 如果有设备读取失败，不进行比较
     if (anyDeviceFailed) {
-        Serial.println("  ⚠ Skipping comparison due to read failure");
+        Serial.println("Read failed, skipping comparison");
         return false;
-    }
-
-    // 打印当前扫描数据（每10次打印一次完整数据）
-    if (scanCount % 10 == 0) {
-        printDeviceData("CURRENT SCAN DATA", currentScan);
-        Serial.printf("Total active bits: %d\n", totalActiveBits);
     }
 
     // 检查是否有变化，但只对掩码为1的位进行比较
     bool changeDetected = false;
     int totalDeviations = 0;
-    Serial.println("\n  >>> Comparing with baseline (masked bits only):");
 
     for (int device = 1; device <= NUM_DEVICES; device++) {
-        int deviceDeviations = 0;
         for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
             if (baselineMask[device - 1][i] == 1) {  // 只有当掩码为1时才比较
                 if (currentScan[device - 1][i] != baseline[device - 1][i]) {
                     if (!changeDetected) {
-                        Serial.println("\n  !!! DEVIATION DETECTED !!!");
+                        Serial.println("\n\n╔════════════════════════════════════════════╗");
+                        Serial.println("║          BASELINE DEVIATION DETECTED!      ║");
+                        Serial.println("╚════════════════════════════════════════════╝");
                     }
                     changeDetected = true;
-                    deviceDeviations++;
                     totalDeviations++;
 
                     // 打印详细的差异信息
                     HardwareCoord coord = INDEX_MAP[(device - 1) * NUM_INPUTS_PER_DEVICE + i];
-                    Serial.printf("    Device %d, Input %d [Grid: Row %d, Col %d]: Baseline=%d -> Current=%d\n",
+                    Serial.printf("  Device %d, Input %d [Row %d, Col %d]: %d → %d\n",
                                   device, i, coord.row, coord.col,
                                   baseline[device - 1][i], currentScan[device - 1][i]);
                 }
             }
         }
-
-        if (deviceDeviations > 0) {
-            Serial.printf("  Device %d: %d deviations found\n", device, deviceDeviations);
-        }
     }
 
     if (changeDetected) {
-        Serial.printf("\n  ✗ Total deviations: %d\n", totalDeviations);
-        Serial.println("  ╔════════════════════════════════════════════╗");
-        Serial.println("  ║        TRIGGERING BASELINE ALERT!          ║");
-        Serial.println("  ╚════════════════════════════════════════════╝");
-
-        // 打印当前完整状态用于调试
+        Serial.printf("\n✗ Total deviations: %d\n", totalDeviations);
         printDeviceData("TRIGGERED SCAN DATA", currentScan);
     } else {
-        Serial.println("  ✓ No deviations detected - baseline stable");
+        // 正常情况：简短输出
+        Serial.printf("OK - %d active bits (baseline stable)\n", totalActiveBits);
     }
 
     return changeDetected;
@@ -510,7 +467,7 @@ bool checkForChanges() {
 // 统一的触发处理函数
 void handleTriggerDetected() {
     if (!triggerSent) {
-        Serial.println("Trigger detected, publishing MQTT message (first time)");
+        Serial.println("\n✓ Publishing MQTT trigger: receiver/triggered");
         client.publish(mqtt_topic, "");
         triggerSent = true;
     }
@@ -560,7 +517,7 @@ void handleSerialCommands() {
             Serial.printf("Baseline Delay (bd):      %lu ms\n", baselineDelay);
             Serial.printf("Scan Interval (si):       %lu ms\n", scanInterval);
             Serial.printf("Baseline Stable Time (st): %lu ms\n", baselineStableTime);
-            Serial.printf("Current State:            %d (0=IDLE, 1=ACTIVE, 2=BASELINE_WAITING, 3=BASELINE_INIT_0, 4=BASELINE_INIT_1, 5=BASELINE_INIT_2, 6=BASELINE_CALC, 7=BASELINE_ACTIVE)\n", currentState);
+            Serial.printf("Current State:            %d (0=IDLE, 1=ACTIVE, 2=BASELINE_WAITING, 3=BASELINE_INIT_0, 4=BASELINE_INIT_1, 5=BASELINE_CALC, 6=BASELINE_ACTIVE)\n", currentState);
             Serial.printf("MQTT Connected:           %s\n", client.connected() ? "Yes" : "No");
             Serial.printf("Trigger Sent:             %s\n", triggerSent ? "Yes" : "No");
             Serial.println("==========================================\n");
@@ -587,7 +544,7 @@ void handleSerialCommands() {
                     Serial.printf("!!! Failed to read device %d\n", device);
                 }
                 if (device < NUM_DEVICES) {
-                    delay(20);
+                    delay(10);  // 优化为10ms
                 }
             }
             printDeviceData("MANUAL SCAN RESULT", manualScan);
@@ -647,7 +604,6 @@ void setup() {
     for (int device = 1; device <= NUM_DEVICES; device++) {
         webServer.updateAllDeviceStates(device, zeroStates);
     }
-    Serial.println("Initialized all device states to 0");
 
     // 初始化计时变量
     lastTriggerTime = 0;
@@ -657,8 +613,11 @@ void setup() {
 
     // 初始化系统状态为 ACTIVE（直接激活，无需等待 btn/resetAll）
     currentState = ACTIVE;
-    Serial.println("System initialized in ACTIVE state, ready to accept changeState messages");
-    Serial.println("Type 'help' for serial commands");
+    Serial.println("\n╔════════════════════════════════════════════╗");
+    Serial.println("║     LASER SENSOR SYSTEM INITIALIZED        ║");
+    Serial.println("║   Status: ACTIVE - Ready for changeState   ║");
+    Serial.println("╚════════════════════════════════════════════╝");
+    Serial.println("Type 'help' for serial commands\n");
 }
 
 void loop() {
@@ -678,16 +637,6 @@ void loop() {
     webServer.handleClient();
 
     unsigned long currentTime = millis();
-
-    // 定期打印系统状态（每10秒）
-    static unsigned long lastStatusReport = 0;
-    if (currentTime - lastStatusReport >= 10000) {
-        Serial.printf("Status Report - MQTT: %s, State: %d, Time: %lu\n",
-                      client.connected() ? "Connected" : "Disconnected",
-                      currentState,
-                      currentTime);
-        lastStatusReport = currentTime;
-    }
 
     // 定期广播状态到所有SSE客户端
     static unsigned long lastBroadcastTime = 0;
@@ -719,7 +668,7 @@ void loop() {
             // 等待基线延迟时间到达
             if (currentTime >= baselineSetTime) {
                 currentState = BASELINE_INIT_0; // 开始第一次基线扫描
-                baselineSetTime = millis() + 200; // 200ms后进行第一次扫描
+                baselineSetTime = millis() + 50; // 50ms后进行第一次扫描
             }
             break;
 
@@ -733,9 +682,9 @@ void loop() {
                 printDeviceData("RAW SCAN #0 RESULT", init_0);
                 int count0 = countActiveBits(init_0);
                 Serial.printf("✓ Scan #0: %d active bits captured\n", count0);
-                Serial.println(">>> Waiting 200ms before scan #1...\n");
+                Serial.println(">>> Waiting 50ms before scan #1...\n");
                 currentState = BASELINE_INIT_1; // 转到第二次扫描
-                baselineSetTime = millis() + 200; // 200ms后进行第二次扫描
+                baselineSetTime = millis() + 50; // 50ms后进行第二次扫描
             }
             break;
 
@@ -749,29 +698,13 @@ void loop() {
                 printDeviceData("RAW SCAN #1 RESULT", init_1);
                 int count1 = countActiveBits(init_1);
                 Serial.printf("✓ Scan #1: %d active bits captured\n", count1);
-                Serial.println(">>> Waiting 200ms before scan #2...\n");
-                currentState = BASELINE_INIT_2; // 转到第三次扫描
-                baselineSetTime = millis() + 200; // 200ms后进行第三次扫描
-            }
-            break;
-
-        case BASELINE_INIT_2:
-            // 等待第三次扫描时间到达
-            if (currentTime >= baselineSetTime) {
-                Serial.println("\n╔════════════════════════════════════════════╗");
-                Serial.println("║       BASELINE SCAN #2 INITIATED           ║");
-                Serial.println("╚════════════════════════════════════════════╝");
-                scanBaseline(init_2); // 执行第三次扫描
-                printDeviceData("RAW SCAN #2 RESULT", init_2);
-                int count2 = countActiveBits(init_2);
-                Serial.printf("✓ Scan #2: %d active bits captured\n", count2);
                 Serial.println(">>> Proceeding to baseline calculation...\n");
                 currentState = BASELINE_CALC; // 转到基线计算阶段
             }
             break;
 
         case BASELINE_CALC:
-            // 计算最终基线（三次扫描结果进行与运算）
+            // 计算最终基线（两次扫描结果进行AND运算）
             calculateFinalBaseline(); // 计算并设置最终基线，自动进入BASELINE_ACTIVE状态
             break;
 
@@ -780,7 +713,6 @@ void loop() {
             if (currentTime - lastBaselineCheck >= scanInterval) {
                 lastBaselineCheck = currentTime;
                 if (checkForChanges()) {
-                    Serial.println("Baseline deviation detected");
                     handleTriggerDetected();
                 }
             }
