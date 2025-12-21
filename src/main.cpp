@@ -100,17 +100,26 @@ void setup_wifi() {
     Serial.println(ssid);
 
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);  // 启用WiFi自动重连
+    WiFi.persistent(true);         // 保存WiFi配置
     WiFi.begin(ssid, password);
 
-    while (WiFi.status() != WL_CONNECTED) {
+    int timeout = 0;
+    while (WiFi.status() != WL_CONNECTED && timeout < 20) {
         delay(500);
         Serial.print(".");
+        timeout++;
     }
 
-    Serial.println("");
-    Serial.println("WiFi connected");
-    Serial.println("IP address: ");
-    Serial.println(WiFi.localIP());
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("");
+        Serial.println("WiFi connected");
+        Serial.println("IP address: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\nWiFi connection failed! Restarting...");
+        ESP.restart();
+    }
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
@@ -146,12 +155,16 @@ void reconnect() {
     static unsigned long lastReconnectAttempt = 0;
     unsigned long now = millis();
 
-    if (now - lastReconnectAttempt > 3000) {
+    if (now - lastReconnectAttempt > 5000) {  // 3秒→5秒，减少重连频率
         lastReconnectAttempt = now;
+
+        Serial.print("MQTT reconnecting... ");
         if (client.connect(mqtt_client_id)) {
             client.subscribe(changeState_topic);
             client.subscribe(btn_resetAll_topic);
-            Serial.println("MQTT connected + subscribed");
+            Serial.println("connected + subscribed");
+        } else {
+            Serial.printf("failed, rc=%d\n", client.state());
         }
     }
 }
@@ -258,12 +271,14 @@ void calculateFinalBaseline() {
     memset(baselineMask, 0, sizeof(baselineMask));
 
     int totalBaseline = 0;
+    int votingStats[4] = {0}; // 统计: [0票, 1票, 2票, 3票]
 
     // 优化：直接使用0-based索引，避免d-1转换
     for (int d = 0; d < NUM_DEVICES; d++) {
         for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
 
             int sum = init_0[d][i] + init_1[d][i] + init_2[d][i];
+            votingStats[sum]++;
 
             // 多数投票：≥2则视为基线
             if (sum >= 2) {
@@ -275,7 +290,20 @@ void calculateFinalBaseline() {
         }
     }
 
-    Serial.printf("Final baseline bits: %d\n", totalBaseline);
+    // 投票统计信息
+    Serial.println("\n--- VOTING STATISTICS ---");
+    Serial.printf("0 votes (all OFF):  %d bits\n", votingStats[0]);
+    Serial.printf("1 vote  (unstable): %d bits\n", votingStats[1]);
+    Serial.printf("2 votes (majority): %d bits → BASELINE\n", votingStats[2]);
+    Serial.printf("3 votes (all ON):   %d bits → BASELINE\n", votingStats[3]);
+    Serial.printf("\nTotal baseline bits: %d / 192\n", totalBaseline);
+
+    // 显示最终基线数据
+    printDeviceData("FINAL BASELINE", baseline);
+
+    Serial.println("\n✓✓✓ BASELINE ESTABLISHED ✓✓✓");
+    Serial.printf("Monitoring active (scan interval: %lums)\n", scanInterval);
+
     currentState = BASELINE_ACTIVE;
     lastBaselineCheck = millis() + baselineStableTime;
     consecutiveCount = 0;
@@ -347,6 +375,9 @@ void setup() {
     setup_wifi();
 
     client.setServer(mqtt_server, 1883);
+    client.setBufferSize(1024); // 增加 MQTT 缓冲区到 512 字节（默认 256）
+    client.setKeepAlive(60); // 设置 keepalive 为60秒
+    client.setSocketTimeout(15); // 设置 socket 超时为15秒
     client.setCallback(callback);
 
     webServer.begin();
@@ -384,7 +415,10 @@ void loop() {
         case BASELINE_INIT_0:
             if (now >= baselineSetTime) {
                 scanBaseline(init_0);
-                Serial.println("=== BASELINE SCAN #1 ===");
+                Serial.printf("Scan #0 completed: %d active bits\n", countActiveBits(init_0));
+                printDeviceData("SCAN #0 DATA", init_0);
+
+                Serial.println("\n=== BASELINE SCAN #1 ===");
                 currentState = BASELINE_INIT_1;
                 baselineSetTime = millis() + 50;
             }
@@ -393,7 +427,10 @@ void loop() {
         case BASELINE_INIT_1:
             if (now >= baselineSetTime) {
                 scanBaseline(init_1);
-                Serial.println("=== BASELINE SCAN #2 ===");
+                Serial.printf("Scan #1 completed: %d active bits\n", countActiveBits(init_1));
+                printDeviceData("SCAN #1 DATA", init_1);
+
+                Serial.println("\n=== BASELINE SCAN #2 ===");
                 currentState = BASELINE_INIT_2;
                 baselineSetTime = millis() + 50;
             }
@@ -402,6 +439,10 @@ void loop() {
         case BASELINE_INIT_2:
             if (now >= baselineSetTime) {
                 scanBaseline(init_2);
+                Serial.printf("Scan #2 completed: %d active bits\n", countActiveBits(init_2));
+                printDeviceData("SCAN #2 DATA", init_2);
+
+                Serial.println("\n=== CALCULATING FINAL BASELINE (Majority Vote) ===");
                 currentState = BASELINE_CALC;
             }
             break;
