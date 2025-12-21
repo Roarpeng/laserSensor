@@ -33,7 +33,6 @@ enum SystemState {
     BASELINE_WAITING,
     BASELINE_INIT_0,
     BASELINE_INIT_1,
-    BASELINE_INIT_2,
     BASELINE_CALC,
     BASELINE_ACTIVE
 };
@@ -79,7 +78,6 @@ unsigned long lastBaselineCheck = 0;
 uint8_t baseline[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 uint8_t init_0[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 uint8_t init_1[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
-uint8_t init_2[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 
 uint8_t baselineMask[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 
@@ -137,7 +135,6 @@ void callback(char* topic, byte* payload, unsigned int length) {
         if (currentState == BASELINE_WAITING ||
             currentState == BASELINE_INIT_0 ||
             currentState == BASELINE_INIT_1 ||
-            currentState == BASELINE_INIT_2 ||
             currentState == BASELINE_CALC) {
             return;
         }
@@ -271,17 +268,13 @@ void calculateFinalBaseline() {
     memset(baselineMask, 0, sizeof(baselineMask));
 
     int totalBaseline = 0;
-    int votingStats[4] = {0}; // 统计: [0票, 1票, 2票, 3票]
 
-    // 优化：直接使用0-based索引，避免d-1转换
+    // 2次扫描：与运算，两次都为1才算基线
     for (int d = 0; d < NUM_DEVICES; d++) {
         for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
 
-            int sum = init_0[d][i] + init_1[d][i] + init_2[d][i];
-            votingStats[sum]++;
-
-            // 多数投票：≥2则视为基线
-            if (sum >= 2) {
+            // AND逻辑：两次扫描都是1才视为基线
+            if (init_0[d][i] && init_1[d][i]) {
                 baseline[d][i] = 1;
                 baselineMask[d][i] = 1;
                 totalBaseline++;
@@ -290,13 +283,7 @@ void calculateFinalBaseline() {
         }
     }
 
-    // 投票统计信息
-    Serial.println("\n--- VOTING STATISTICS ---");
-    Serial.printf("0 votes (all OFF):  %d bits\n", votingStats[0]);
-    Serial.printf("1 vote  (unstable): %d bits\n", votingStats[1]);
-    Serial.printf("2 votes (majority): %d bits → BASELINE\n", votingStats[2]);
-    Serial.printf("3 votes (all ON):   %d bits → BASELINE\n", votingStats[3]);
-    Serial.printf("\nTotal baseline bits: %d / 192\n", totalBaseline);
+    Serial.printf("\nTotal baseline bits: %d / 192 (2-scan AND logic)\n", totalBaseline);
 
     // 显示最终基线数据
     printDeviceData("FINAL BASELINE", baseline);
@@ -408,7 +395,7 @@ void loop() {
             if (now >= baselineSetTime) {
                 Serial.println("\n=== BASELINE SCAN #0 ===");
                 currentState = BASELINE_INIT_0;
-                baselineSetTime = millis() + 50;
+                baselineSetTime = millis() + 100;
             }
             break;
 
@@ -420,7 +407,7 @@ void loop() {
 
                 Serial.println("\n=== BASELINE SCAN #1 ===");
                 currentState = BASELINE_INIT_1;
-                baselineSetTime = millis() + 50;
+                baselineSetTime = millis() + 100;
             }
             break;
 
@@ -430,19 +417,7 @@ void loop() {
                 Serial.printf("Scan #1 completed: %d active bits\n", countActiveBits(init_1));
                 printDeviceData("SCAN #1 DATA", init_1);
 
-                Serial.println("\n=== BASELINE SCAN #2 ===");
-                currentState = BASELINE_INIT_2;
-                baselineSetTime = millis() + 50;
-            }
-            break;
-
-        case BASELINE_INIT_2:
-            if (now >= baselineSetTime) {
-                scanBaseline(init_2);
-                Serial.printf("Scan #2 completed: %d active bits\n", countActiveBits(init_2));
-                printDeviceData("SCAN #2 DATA", init_2);
-
-                Serial.println("\n=== CALCULATING FINAL BASELINE (Majority Vote) ===");
+                Serial.println("\n=== CALCULATING FINAL BASELINE (AND Logic) ===");
                 currentState = BASELINE_CALC;
             }
             break;
