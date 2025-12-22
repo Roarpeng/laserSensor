@@ -33,6 +33,7 @@ enum SystemState {
     BASELINE_WAITING,
     BASELINE_INIT_0,
     BASELINE_INIT_1,
+    BASELINE_INIT_2,
     BASELINE_CALC,
     BASELINE_ACTIVE
 };
@@ -78,18 +79,20 @@ unsigned long lastBaselineCheck = 0;
 uint8_t baseline[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 uint8_t init_0[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 uint8_t init_1[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
+uint8_t init_2[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 
 uint8_t baselineMask[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 
-unsigned long baselineDelay = 200;        // 优化: 延时
-unsigned long scanInterval = 300;        // 优化: 扫描间隔
-unsigned long baselineStableTime = 100;   // 优化: 基线稳定时间
+unsigned long baselineDelay = 200;        // 200ms wait before starting scans
+unsigned long scanInterval = 100;        // 100ms monitoring interval
+unsigned long baselineScanInterval = 20;  // 20ms between baseline scans
+unsigned long baselineStableTime = 50;   // Short wait before active
 
 bool triggerSent = false;
 
 // ======== NEW THRESHOLD PARAMETERS ========
-const int deviationThreshold = 3;   // 偏差阈值
-const int consecutiveThreshold = 2; // 连续次数阈值
+const int deviationThreshold = 2;   // 2 bits different
+const int consecutiveThreshold = 1; // Immediate trigger
 int consecutiveCount = 0;
 void setup_wifi() {
     delay(10);
@@ -135,6 +138,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
         if (currentState == BASELINE_WAITING ||
             currentState == BASELINE_INIT_0 ||
             currentState == BASELINE_INIT_1 ||
+            currentState == BASELINE_INIT_2 ||
             currentState == BASELINE_CALC) {
             return;
         }
@@ -269,21 +273,20 @@ void calculateFinalBaseline() {
 
     int totalBaseline = 0;
 
-    // 2次扫描：与运算，两次都为1才算基线
+    // 3 Scans: AND Logic
     for (int d = 0; d < NUM_DEVICES; d++) {
         for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
 
-            // AND逻辑：两次扫描都是1才视为基线
-            if (init_0[d][i] && init_1[d][i]) {
+            // AND logic: All 3 scans must be 1
+            if (init_0[d][i] && init_1[d][i] && init_2[d][i]) {
                 baseline[d][i] = 1;
                 baselineMask[d][i] = 1;
                 totalBaseline++;
             }
-            // else分支可省略，因memset已清零
         }
     }
 
-    Serial.printf("\nTotal baseline bits: %d / 192 (2-scan AND logic)\n", totalBaseline);
+    Serial.printf("\nTotal baseline bits: %d / 192 (3-scan AND logic)\n", totalBaseline);
 
     // 显示最终基线数据
     printDeviceData("FINAL BASELINE", baseline);
@@ -395,7 +398,7 @@ void loop() {
             if (now >= baselineSetTime) {
                 Serial.println("\n=== BASELINE SCAN #0 ===");
                 currentState = BASELINE_INIT_0;
-                baselineSetTime = millis() + 100;
+                baselineSetTime = millis() + baselineScanInterval;
             }
             break;
 
@@ -403,11 +406,10 @@ void loop() {
             if (now >= baselineSetTime) {
                 scanBaseline(init_0);
                 Serial.printf("Scan #0 completed: %d active bits\n", countActiveBits(init_0));
-                printDeviceData("SCAN #0 DATA", init_0);
-
+                
                 Serial.println("\n=== BASELINE SCAN #1 ===");
                 currentState = BASELINE_INIT_1;
-                baselineSetTime = millis() + 100;
+                baselineSetTime = millis() + baselineScanInterval;
             }
             break;
 
@@ -415,7 +417,17 @@ void loop() {
             if (now >= baselineSetTime) {
                 scanBaseline(init_1);
                 Serial.printf("Scan #1 completed: %d active bits\n", countActiveBits(init_1));
-                printDeviceData("SCAN #1 DATA", init_1);
+
+                Serial.println("\n=== BASELINE SCAN #2 ===");
+                currentState = BASELINE_INIT_2;
+                baselineSetTime = millis() + baselineScanInterval;
+            }
+            break;
+
+        case BASELINE_INIT_2:
+            if (now >= baselineSetTime) {
+                scanBaseline(init_2);
+                Serial.printf("Scan #2 completed: %d active bits\n", countActiveBits(init_2));
 
                 Serial.println("\n=== CALCULATING FINAL BASELINE (AND Logic) ===");
                 currentState = BASELINE_CALC;
