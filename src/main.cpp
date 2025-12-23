@@ -320,7 +320,7 @@ bool checkForChanges() {
 
   // 2. 打印日志 (每200ms)
   if (millis() - lastLogTime > 200) {
-    printDeviceData("MONITOR SCAN (Turbo)", currentScan);
+    printDeviceData("MONITOR SCAN", currentScan);
     lastLogTime = millis();
   }
 
