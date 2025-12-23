@@ -27,21 +27,24 @@ const char *debug_printBaseline_topic = "debug/printBaseline";
 #define NUM_DEVICES 4
 #define NUM_INPUTS_PER_DEVICE 48
 
-// ============== 触发灵敏度与容差设置 (请在此处修改) ==============
+// ==============================================================================
+// ============== [核心配置区] 每个设备独立设置灵敏度和稳定性 ==============
+// ==============================================================================
 
-// 1. [对比容差] 缺失光束阈值
-//    含义：只有当总共缺失的光束数量 >= 此值时，才被视为一次“异常检测”。
-//    举例：设置为 1，表示少 1 个点就算异常。
-//    举例：设置为 3，表示允许少 1-2 个点(作为容差)，少 3 个点才算异常。
-const int MISSING_BEAMS_THRESHOLD = 1; 
+// 1. [独立容差] 缺失光束阈值 (Tolerance)
+//    含义：该设备当前有效点数比基线少多少时，视为“异常”。
+//    数组顺序：{设备1设置, 设备2设置, 设备3设置, 设备4设置}
+//    建议：环境好的设备设为 1，灰尘多或不重要的设备设为 2 或 3。
+const int DEVICE_TOLERANCE[NUM_DEVICES] = { 1, 1, 1, 1 }; 
 
-// 2. [检测次数] 连续确认次数
-//    含义：连续多少次扫描都检测到“异常”，才真正触发 MQTT 报警。
-//    作用：防止瞬间的电气干扰或飞虫误触发。
-//    举例：设置为 2，表示需要连续 2 次扫描(约60ms)都缺失，才报警。
-const int TRIGGER_CONFIRM_TIMES = 2;
+// 2. [独立去抖] 连续确认次数 (Debounce)
+//    含义：该设备必须“连续”多少次扫描都处于异常状态，才触发最终报警。
+//    数组顺序：{设备1设置, 设备2设置, 设备3设置, 设备4设置}
+//    建议：需要极快响应设为 1 或 2，需要极高抗干扰设为 3 到 5。
+//    注意：扫描间隔约 30ms，设置为 3 大约意味着持续遮挡 90ms 才报警。
+const int DEVICE_DEBOUNCE[NUM_DEVICES]  = { 2, 2, 2, 2 };
 
-// ==============================================================
+// ==============================================================================
 
 // ============== 系统状态机 ==============
 enum SystemState {
@@ -75,8 +78,11 @@ uint8_t init_0[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 uint8_t init_1[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 uint8_t init_2[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 
-// 存储每个设备独立的基线点数
+// 存储每个设备独立的基线总点数
 int baselineDeviceCounts[NUM_DEVICES]; 
+
+// [新增] 存储每个设备当前的连续异常计数
+int currentConsecutiveErrors[NUM_DEVICES];
 
 unsigned long baselineDelay = 200;       
 unsigned long scanInterval = 30;         
@@ -84,7 +90,6 @@ unsigned long baselineScanInterval = 20;
 unsigned long baselineStableTime = 50;   
 
 bool triggerSent = false;
-int consecutiveCount = 0; // 当前连续异常计数
 
 void setup_wifi() {
   delay(10);
@@ -127,7 +132,6 @@ void callback(char *topic, byte *payload, unsigned int length) {
   if (strcmp(topic, changeState_topic) == 0) {
     if (currentState == IDLE) return;
     
-    // 如果正在建立基线，忽略新的请求
     if (currentState >= BASELINE_WAITING && currentState <= BASELINE_CALC) {
       return;
     }
@@ -136,7 +140,10 @@ void callback(char *topic, byte *payload, unsigned int length) {
     currentState = BASELINE_WAITING;
     baselineSetTime = millis() + baselineDelay;
     triggerSent = false;
-    consecutiveCount = 0;
+    
+    // 重置所有设备的计数器
+    for(int i=0; i<NUM_DEVICES; i++) currentConsecutiveErrors[i] = 0;
+    
     return;
   }
 }
@@ -237,7 +244,6 @@ int countActiveBits(uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
   return cnt;
 }
 
-// 计算单个设备数组中的有效位
 int countSingleDeviceBits(uint8_t *deviceArr) {
   int cnt = 0;
   for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
@@ -270,19 +276,20 @@ bool scanBaseline(uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
 void calculateFinalBaseline() {
   memset(baseline, 0, sizeof(baseline));
   memset(baselineDeviceCounts, 0, sizeof(baselineDeviceCounts));
+  
+  // 清零状态计数器
+  for(int i=0; i<NUM_DEVICES; i++) currentConsecutiveErrors[i] = 0;
 
   int totalBits = 0;
 
   for (int d = 0; d < NUM_DEVICES; d++) {
     int deviceBits = 0;
     for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
-      // 与逻辑: 3次扫描必须全为1
       if (init_0[d][i] && init_1[d][i] && init_2[d][i]) {
         baseline[d][i] = 1;
         deviceBits++;
       }
     }
-    // 存储该设备独立的基线值
     baselineDeviceCounts[d] = deviceBits;
     totalBits += deviceBits;
     
@@ -292,21 +299,20 @@ void calculateFinalBaseline() {
   Serial.printf("Total baseline bits (Global): %d / 192\n", totalBits);
   printDeviceData("FINAL BASELINE", baseline);
 
-  Serial.println("\n✓✓✓ BASELINE ESTABLISHED (Per-Device Mode) ✓✓✓");
+  Serial.println("\n✓✓✓ BASELINE ESTABLISHED (Independent Config Mode) ✓✓✓");
   Serial.printf("Monitoring active (scan interval: %lums)\n", scanInterval);
 
   currentState = BASELINE_ACTIVE;
   lastBaselineCheck = millis() + baselineStableTime;
-  consecutiveCount = 0;
 }
 
-// ========== 核心监测逻辑 (支持容差与去抖) ==========
+// ========== 核心监测逻辑 (独立设备、独立配置) ==========
 bool checkForChanges() {
   if (currentState != BASELINE_ACTIVE)
     return false;
 
   uint8_t currentScan[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
-  int totalMissingBeams = 0; // 本次扫描所有设备缺失光束的总和
+  bool anyDeviceTriggered = false; // 只要有一个设备确认触发，就置为true
 
   // 1. 扫描所有设备
   for (int d = 1; d <= NUM_DEVICES; d++) {
@@ -324,46 +330,49 @@ bool checkForChanges() {
     lastLogTime = millis();
   }
 
-  // 3. 逐个设备对比，计算缺失量
+  // 3. 逐个设备独立判断
   for (int d = 0; d < NUM_DEVICES; d++) {
     int currentCount = countSingleDeviceBits(currentScan[d]);
     int baselineCount = baselineDeviceCounts[d];
     
-    // 计算差异: 基线 - 当前
+    // 计算缺失点数 (基线 - 当前)
     int diff = baselineCount - currentCount;
 
-    // 逻辑：只有当 diff > 0 (即缺失) 时才计入。
-    // 如果 diff < 0 (即当前点数 > 基线，说明有干扰亮点)，忽略，不计入缺失，也不抵消其他设备的缺失。
-    if (diff > 0) {
-      // 调试打印：仅当发现该设备有缺失时打印
-      Serial.printf(">> Dev %d MISSING: Baseline=%d, Curr=%d, Missing=%d\n", 
-                    d+1, baselineCount, currentCount, diff);
-      totalMissingBeams += diff;
+    // 获取该设备的配置参数
+    int myTolerance = DEVICE_TOLERANCE[d];
+    int myDebounceTarget = DEVICE_DEBOUNCE[d];
+
+    // 判断逻辑：当前设备缺失数 >= 该设备的容差
+    if (diff >= myTolerance) {
+      // 增加该设备的连续异常计数
+      currentConsecutiveErrors[d]++;
+
+      Serial.printf(">> Dev %d ALARM: Missing %d (Thresh %d). Count %d/%d\n", 
+                    d+1, diff, myTolerance, currentConsecutiveErrors[d], myDebounceTarget);
+
+      // 检查是否达到该设备的确认次数
+      if (currentConsecutiveErrors[d] >= myDebounceTarget) {
+        anyDeviceTriggered = true; // 标记触发
+        // 注意：这里不重置计数器，或者重置都可以。
+        // 为了防止连续发MQTT，通常在 handleTriggerDetected 里控制
+      }
+
+    } else {
+      // 如果该设备本次正常（或误差在容差内），重置该设备的计数器
+      if (currentConsecutiveErrors[d] > 0) {
+        Serial.printf("Dev %d recovered (Count reset)\n", d+1);
+      }
+      currentConsecutiveErrors[d] = 0;
     }
   }
 
-  // 4. 判断是否满足报警条件
-  // 条件：(总缺失数 >= 容差阈值)
-  if (totalMissingBeams >= MISSING_BEAMS_THRESHOLD) {
-    consecutiveCount++; // 满足条件，计数器+1
-
-    Serial.printf("Warning: Total Missing %d (Threshold %d). Consecutive Count: %d/%d\n",
-                  totalMissingBeams, MISSING_BEAMS_THRESHOLD, consecutiveCount,
-                  TRIGGER_CONFIRM_TIMES);
-
-    // 判断是否连续满足次数
-    if (consecutiveCount >= TRIGGER_CONFIRM_TIMES) {
-      Serial.println(">>> TRIGGER CONFIRMED (Alarm) <<<");
-      consecutiveCount = 0; // 触发后重置计数器 (或根据需求保持)
-      return true;
-    }
-  } else {
-    // 如果本次扫描正常（或者缺失数在容差范围内），重置连续计数器
-    // 这实现了“必须连续N次”的逻辑，中间断一次就重来
-    if (consecutiveCount > 0) {
-       Serial.println("Warning cleared (Consecutive count reset).");
-    }
-    consecutiveCount = 0;
+  // 4. 如果有任意一个设备满足了触发条件
+  if (anyDeviceTriggered) {
+    Serial.println(">>> TRIGGER CONFIRMED (By at least one device) <<<");
+    // 重置所有计数器？或者保留？
+    // 这里选择重置，以便下一个周期重新检测
+    for(int i=0; i<NUM_DEVICES; i++) currentConsecutiveErrors[i] = 0;
+    return true;
   }
 
   return false;
