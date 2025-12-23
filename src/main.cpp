@@ -27,6 +27,22 @@ const char *debug_printBaseline_topic = "debug/printBaseline";
 #define NUM_DEVICES 4
 #define NUM_INPUTS_PER_DEVICE 48
 
+// ============== 触发灵敏度与容差设置 (请在此处修改) ==============
+
+// 1. [对比容差] 缺失光束阈值
+//    含义：只有当总共缺失的光束数量 >= 此值时，才被视为一次“异常检测”。
+//    举例：设置为 1，表示少 1 个点就算异常。
+//    举例：设置为 3，表示允许少 1-2 个点(作为容差)，少 3 个点才算异常。
+const int MISSING_BEAMS_THRESHOLD = 1; 
+
+// 2. [检测次数] 连续确认次数
+//    含义：连续多少次扫描都检测到“异常”，才真正触发 MQTT 报警。
+//    作用：防止瞬间的电气干扰或飞虫误触发。
+//    举例：设置为 2，表示需要连续 2 次扫描(约60ms)都缺失，才报警。
+const int TRIGGER_CONFIRM_TIMES = 2;
+
+// ==============================================================
+
 // ============== 系统状态机 ==============
 enum SystemState {
   IDLE,
@@ -47,11 +63,8 @@ PubSubClient client(espClient);
 LaserWebServer webServer;
 
 // ============== 计时变量 ==============
-unsigned long lastTriggerTime = 0;
-unsigned long lastReadFailTime = 0;
-unsigned long lastScanTime = 0;
 unsigned long lastLogTime = 0;
-int currentDevice = 1;
+unsigned long lastReadFailTime = 0;
 
 // ============== 基线变量 ==============
 unsigned long baselineSetTime = 0;
@@ -62,9 +75,7 @@ uint8_t init_0[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 uint8_t init_1[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 uint8_t init_2[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 
-uint8_t baselineMask[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
-
-// [新增] 存储每个设备独立的基线点数
+// 存储每个设备独立的基线点数
 int baselineDeviceCounts[NUM_DEVICES]; 
 
 unsigned long baselineDelay = 200;       
@@ -73,12 +84,7 @@ unsigned long baselineScanInterval = 20;
 unsigned long baselineStableTime = 50;   
 
 bool triggerSent = false;
-
-// ============== 触发灵敏度调整参数 ==============
-const int deviationThreshold = 1;
-const int consecutiveThreshold = 2;
-
-int consecutiveCount = 0;
+int consecutiveCount = 0; // 当前连续异常计数
 
 void setup_wifi() {
   delay(10);
@@ -222,7 +228,6 @@ void printDeviceData(const char *label, uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_
   }
 }
 
-// 保持此函数用于日志打印 (计算全局总数)
 int countActiveBits(uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
   int cnt = 0;
   for (int d = 0; d < NUM_DEVICES; d++)
@@ -232,7 +237,7 @@ int countActiveBits(uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
   return cnt;
 }
 
-// [新增] 计算单个设备数组中的有效位
+// 计算单个设备数组中的有效位
 int countSingleDeviceBits(uint8_t *deviceArr) {
   int cnt = 0;
   for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
@@ -262,12 +267,9 @@ bool scanBaseline(uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
   return true;
 }
 
-// ========== UPDATED: 计算基线 (分设备存储) ==========
 void calculateFinalBaseline() {
-  // 清零
   memset(baseline, 0, sizeof(baseline));
-  memset(baselineMask, 0, sizeof(baselineMask));
-  memset(baselineDeviceCounts, 0, sizeof(baselineDeviceCounts)); // 清零计数数组
+  memset(baselineDeviceCounts, 0, sizeof(baselineDeviceCounts));
 
   int totalBits = 0;
 
@@ -277,11 +279,10 @@ void calculateFinalBaseline() {
       // 与逻辑: 3次扫描必须全为1
       if (init_0[d][i] && init_1[d][i] && init_2[d][i]) {
         baseline[d][i] = 1;
-        baselineMask[d][i] = 1;
         deviceBits++;
       }
     }
-    // 存储当前设备的基线点数
+    // 存储该设备独立的基线值
     baselineDeviceCounts[d] = deviceBits;
     totalBits += deviceBits;
     
@@ -289,7 +290,6 @@ void calculateFinalBaseline() {
   }
 
   Serial.printf("Total baseline bits (Global): %d / 192\n", totalBits);
-
   printDeviceData("FINAL BASELINE", baseline);
 
   Serial.println("\n✓✓✓ BASELINE ESTABLISHED (Per-Device Mode) ✓✓✓");
@@ -300,15 +300,15 @@ void calculateFinalBaseline() {
   consecutiveCount = 0;
 }
 
-// ========== UPDATED: 监测逻辑 (独立对比) ==========
+// ========== 核心监测逻辑 (支持容差与去抖) ==========
 bool checkForChanges() {
   if (currentState != BASELINE_ACTIVE)
     return false;
 
   uint8_t currentScan[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
-  int totalMissingBeams = 0; // 所有设备缺失光束的总和
+  int totalMissingBeams = 0; // 本次扫描所有设备缺失光束的总和
 
-  // 1. 扫描所有设备并读取数据
+  // 1. 扫描所有设备
   for (int d = 1; d <= NUM_DEVICES; d++) {
     if (!readInputStatus(d, currentScan[d - 1])) {
       Serial.printf("Monitor scan failed at Device %d\n", d);
@@ -324,38 +324,45 @@ bool checkForChanges() {
     lastLogTime = millis();
   }
 
-  // 3. 逐个设备对比差异
+  // 3. 逐个设备对比，计算缺失量
   for (int d = 0; d < NUM_DEVICES; d++) {
     int currentCount = countSingleDeviceBits(currentScan[d]);
     int baselineCount = baselineDeviceCounts[d];
     
-    // 计算该设备缺失的点数 (基线 - 当前)
+    // 计算差异: 基线 - 当前
     int diff = baselineCount - currentCount;
 
-    // 如果缺失点数 > 0，累加到总缺失数中
-    // 注意：如果 diff < 0 (即当前点数比基线多，可能是干扰)，我们这里不扣减总缺失数，
-    // 这样保证了“一个设备增加”不会抵消“另一个设备减少”。
+    // 逻辑：只有当 diff > 0 (即缺失) 时才计入。
+    // 如果 diff < 0 (即当前点数 > 基线，说明有干扰亮点)，忽略，不计入缺失，也不抵消其他设备的缺失。
     if (diff > 0) {
-      Serial.printf(">> Dev %d Deviation: Baseline=%d, Curr=%d, Diff=%d\n", 
+      // 调试打印：仅当发现该设备有缺失时打印
+      Serial.printf(">> Dev %d MISSING: Baseline=%d, Curr=%d, Missing=%d\n", 
                     d+1, baselineCount, currentCount, diff);
       totalMissingBeams += diff;
     }
   }
 
-  // 4. 判断触发条件
-  if (totalMissingBeams >= deviationThreshold) {
-    consecutiveCount++;
+  // 4. 判断是否满足报警条件
+  // 条件：(总缺失数 >= 容差阈值)
+  if (totalMissingBeams >= MISSING_BEAMS_THRESHOLD) {
+    consecutiveCount++; // 满足条件，计数器+1
 
-    Serial.printf("Total Missing: %d / Threshold: %d (Consecutive: %d/%d)\n",
-                  totalMissingBeams, deviationThreshold, consecutiveCount,
-                  consecutiveThreshold);
+    Serial.printf("Warning: Total Missing %d (Threshold %d). Consecutive Count: %d/%d\n",
+                  totalMissingBeams, MISSING_BEAMS_THRESHOLD, consecutiveCount,
+                  TRIGGER_CONFIRM_TIMES);
 
-    if (consecutiveCount >= consecutiveThreshold) {
-      Serial.println(">>> TRIGGER CONFIRMED <<<");
-      consecutiveCount = 0;
+    // 判断是否连续满足次数
+    if (consecutiveCount >= TRIGGER_CONFIRM_TIMES) {
+      Serial.println(">>> TRIGGER CONFIRMED (Alarm) <<<");
+      consecutiveCount = 0; // 触发后重置计数器 (或根据需求保持)
       return true;
     }
   } else {
+    // 如果本次扫描正常（或者缺失数在容差范围内），重置连续计数器
+    // 这实现了“必须连续N次”的逻辑，中间断一次就重来
+    if (consecutiveCount > 0) {
+       Serial.println("Warning cleared (Consecutive count reset).");
+    }
     consecutiveCount = 0;
   }
 
