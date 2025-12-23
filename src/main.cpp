@@ -20,6 +20,7 @@ const char *mqtt_client_id = "receiver";
 const char *mqtt_topic = "receiver/triggered";
 const char *changeState_topic = "changeState";
 const char *btn_resetAll_topic = "btn/resetAll";
+const char *debug_printBaseline_topic = "debug/printBaseline"; // 新增调试指令
 
 // ============== Modbus 设备设置 ==============
 #define BAUD_RATE 115200
@@ -70,6 +71,7 @@ LaserWebServer webServer;
 unsigned long lastTriggerTime = 0;
 unsigned long lastReadFailTime = 0;
 unsigned long lastScanTime = 0;
+unsigned long lastLogTime = 0; // 日志打印时间控制
 int currentDevice = 1;
 
 // ============== 基线变量 ==============
@@ -101,7 +103,7 @@ const int deviationThreshold = 1;
 //    - 含义: 连续多少次扫描检测到差异才触发报警。
 //    - 调整: 增加此值可以过滤掉偶尔的通信错误或抖动。
 //    - 默认值: 1 (立即触发)
-const int consecutiveThreshold = 1;
+const int consecutiveThreshold = 2;
 
 int consecutiveCount = 0;
 int baselineBitCount = 0;
@@ -173,6 +175,7 @@ void reconnect() {
     if (client.connect(mqtt_client_id)) {
       client.subscribe(changeState_topic);
       client.subscribe(btn_resetAll_topic);
+      client.subscribe(debug_printBaseline_topic); // 订阅调试主题
       Serial.println("connected + subscribed");
     } else {
       Serial.printf("failed, rc=%d\n", client.state());
@@ -214,7 +217,8 @@ bool readInputStatus(uint8_t deviceAddress, uint8_t *status_array) {
 
   // @ 115200波特率，15ms完全够用（3-5倍安全余量）
   unsigned long startMicros = micros();
-  const unsigned long timeoutMicros = 25000; // 为了稳定性增加到 25ms
+  const unsigned long timeoutMicros =
+      50000; // 增加到 50ms 以应对更慢的响应或干扰
 
   // 等待足够的响应数据
   while (rs485Serial.available() < responseLength) {
@@ -275,11 +279,24 @@ int countActiveBits(uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
 
 bool scanBaseline(uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
   for (int d = 1; d <= NUM_DEVICES; d++) {
-    if (!readInputStatus(d, arr[d - 1])) {
-      Serial.printf("Error: Baseline scan failed at Device %d\n", d);
-      return false;
+    bool success = false;
+    // 重试逻辑 (最多3次)
+    for (int retry = 0; retry < 3; retry++) {
+      if (readInputStatus(d, arr[d - 1])) {
+        success = true;
+        break; // 读取成功，跳出重试循环
+      }
+      Serial.printf("Warning: Device %d read failed, retrying (%d/3)...\n", d,
+                    retry + 1);
+      delay(10); // 重试前稍微等待
     }
-    delay(2); // Reduced delay for speed while maintaining stability
+
+    if (!success) {
+      Serial.printf("Error: Baseline scan failed PERMANENTLY at Device %d\n",
+                    d);
+      return false; // 3次都失败，真的失败了
+    }
+    delay(3); // 3ms 稳定延时
   }
   return true;
 }
@@ -319,42 +336,41 @@ void calculateFinalBaseline() {
 }
 // ========== UPDATED checkForChanges() ==========
 bool checkForChanges() {
-
   if (currentState != BASELINE_ACTIVE)
     return false;
 
   uint8_t currentScan[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
-  int deviationCount = 0;
+  // int deviationCount = 0; // 局部变量，可以省略或直接计算
 
   // 扫描当前状态
   for (int d = 1; d <= NUM_DEVICES; d++) {
     if (!readInputStatus(d, currentScan[d - 1])) {
       Serial.printf("Monitor scan failed at Device %d\n", d);
+      lastReadFailTime = millis(); // 更新读取失败时间
       return false;
     }
-    delay(2); // Reduced delay for speed
+    delay(3); // 3ms 稳定延时
   }
 
-  // 打印扫描结果 (调试)
-  printDeviceData("MONITOR SCAN", currentScan);
+  // 打印扫描结果 (每200ms打印一次，避免拖慢日志)
+  if (millis() - lastLogTime > 200) {
+    printDeviceData("MONITOR SCAN (Turbo)", currentScan);
+    lastLogTime = millis();
+  }
 
   // 比较总点数 (抗抖动)
   int currentBitCount = countActiveBits(currentScan);
-  int diff = baselineBitCount - currentBitCount;
+  // 计算当前扫描到的有效点数比基线少的数量
+  // 如果 currentBitCount < baselineBitCount，则 deviationDetected
+  // 为正数，表示减少的点数
+  int deviationDetected = baselineBitCount - currentBitCount;
 
-  // 仅当有效点数少于基线时触发
-  if (diff > 0) {
-    deviationCount = diff;
-  } else {
-    deviationCount = 0;
-  }
-
-  if (deviationCount >= deviationThreshold) {
-
+  // 仅当有效点数少于基线时触发，并且减少的数量达到阈值
+  if (deviationDetected >= deviationThreshold) { // 修正此处逻辑
     consecutiveCount++;
 
     Serial.printf("Deviation %d / threshold %d (consecutive %d/%d)\n",
-                  deviationCount, deviationThreshold, consecutiveCount,
+                  deviationDetected, deviationThreshold, consecutiveCount,
                   consecutiveThreshold);
 
     if (consecutiveCount >= consecutiveThreshold) {
@@ -491,13 +507,14 @@ void loop() {
     break;
 
   case BASELINE_ACTIVE:
-    if (now - lastBaselineCheck >= scanInterval) {
-      lastBaselineCheck = now;
+    // Turbo Mode: Run continuously (no interval check)
+    // if (now - lastBaselineCheck >= scanInterval) {
+    // lastBaselineCheck = now;
 
-      if (checkForChanges()) {
-        handleTriggerDetected();
-      }
+    if (checkForChanges()) {
+      handleTriggerDetected();
     }
+    // }
     break;
   }
 }
