@@ -7,10 +7,11 @@ LaserWebServer::LaserWebServer() : server(80) {
     clientCount = 0;
     baselineDelay = 200; // 默认200ms延迟
 
-    // 初始化所有设备状态为0
+    // 初始化所有设备状态为0，屏蔽状态为0
     for(int i = 0; i < 4; i++) {
         for(int j = 0; j < 48; j++) {
             deviceStates[i][j] = 0;
+            shieldedPoints[i][j] = 0;
         }
         isSSEClient[i] = false; // 初始化 SSE 标记
     }
@@ -127,6 +128,7 @@ String LaserWebServer::getDeviceStatesJSON() {
             JsonObject inputObj = inputs.createNestedObject();
             inputObj["id"] = input;
             inputObj["state"] = deviceStates[device-1][input-1];
+            inputObj["shielded"] = shieldedPoints[device-1][input-1]; // [新增]
         }
     }
     
@@ -211,6 +213,46 @@ void LaserWebServer::handleHTTPRequest(WiFiClient& client, int slotIndex) {
         } else {
             String errorJson = "{\"error\":\"Invalid JSON\"}";
             client.print(getHTTPResponse("application/json", errorJson));
+        }
+        client.stop();
+        isSSEClient[slotIndex] = false;
+    }
+    else if(request.indexOf("GET /api/shielding") >= 0) {
+        // [新增] 获取屏蔽设置
+        String json = getShieldingJSON();
+        client.print(getHTTPResponse("application/json", json));
+        client.stop();
+        isSSEClient[slotIndex] = false;
+    }
+    else if(request.indexOf("POST /api/shielding") >= 0) {
+        // [新增] 设置屏蔽点位
+        String body = "";
+        bool bodyStarted = false;
+        while(client.available()) {
+            String line = client.readStringUntil('\r');
+            if(bodyStarted) {
+                body += line;
+            }
+            if(line.length() == 0) {
+                bodyStarted = true;
+            }
+        }
+
+        DynamicJsonDocument doc(1024);
+        if(deserializeJson(doc, body) == DeserializationError::Ok) {
+            int device = doc["device"];
+            int input = doc["input"];
+            bool shielded = doc["shielded"];
+            
+            if(device >= 1 && device <= 4 && input >= 1 && input <= 48) {
+                setShielding(device, input, shielded);
+                String responseJson = "{\"status\":\"ok\"}";
+                client.print(getHTTPResponse("application/json", responseJson));
+            } else {
+                client.print(getHTTPResponse("application/json", "{\"error\":\"Invalid range\"}"));
+            }
+        } else {
+            client.print(getHTTPResponse("application/json", "{\"error\":\"Invalid JSON\"}"));
         }
         client.stop();
         isSSEClient[slotIndex] = false;
@@ -387,6 +429,33 @@ String LaserWebServer::getHTMLPage() {
     html += "        .state-inactive {\n";
     html += "            background-color: #cccccc;\n";
     html += "        }\n";
+    html += "        .state-shielded {\n";
+    html += "            background-color: #ff9800 !important;\n";
+    html += "            border-color: #f57c00 !important;\n";
+    html += "            box-shadow: inset 0 0 5px rgba(0,0,0,0.2);\n";
+    html += "            position: relative;\n";
+    html += "        }\n";
+    html += "        .state-shielded::after {\n";
+    html += "            content: '/';\n";
+    html += "            position: absolute;\n";
+    html += "            top: 50%;\n";
+    html += "            left: 50%;\n";
+    html += "            transform: translate(-50%, -50%);\n";
+    html += "            color: white;\n";
+    html += "            font-weight: bold;\n";
+    html += "            font-size: 14px;\n";
+    html += "        }\n";
+    html += "        .config-mode-active {\n";
+    html += "            border: 2px dashed #ff9800;\n";
+    html += "        }\n";
+    html += "        .input-item.clickable {\n";
+    html += "            cursor: pointer;\n";
+    html += "            transition: transform 0.1s;\n";
+    html += "        }\n";
+    html += "        .input-item.clickable:hover {\n";
+    html += "            transform: scale(1.1);\n";
+    html += "            background-color: #fff3e0;\n";
+    html += "        }\n";
     html += "        .status-bar {\n";
     html += "            text-align: center;\n";
     html += "            padding: 10px;\n";
@@ -420,6 +489,7 @@ String LaserWebServer::getHTMLPage() {
     html += "            <input type=\"number\" id=\"baselineDelay\" min=\"0\" max=\"5000\" step=\"50\" value=\"200\">\n";
     html += "            <button onclick=\"setBaselineDelay()\">Set Delay</button>\n";
     html += "            <button onclick=\"getCurrentBaselineDelay()\">Get Current</button>\n";
+    html += "            <button id=\"toggleConfigBtn\" onclick=\"toggleConfigMode()\" style=\"background-color: #ff9800; margin-left: 20px;\">Enter Shielding Config Mode</button>\n";
     html += "        </div>\n";
     html += "        \n";
     html += "        <div id=\"statusMessage\" class=\"status-message\"></div>\n";
@@ -439,6 +509,7 @@ String LaserWebServer::getHTMLPage() {
     html += "    <script>\n";
     html += "        var eventSource;\n";
     html += "        var deviceData = {};\n";
+    html += "        var configMode = false;\n";
     html += "\n";
     html += "        function setBaselineDelay() {\n";
     html += "            var delay = document.getElementById('baselineDelay').value;\n";
@@ -470,6 +541,45 @@ String LaserWebServer::getHTMLPage() {
     html += "            .catch(error => {\n";
     html += "                console.error('Failed to get baseline delay:', error);\n";
     html += "                showStatusMessage('Failed to get baseline delay', 'error');\n";
+    html += "            });\n";
+    html += "        }\n";
+    html += "\n";
+    html += "        function toggleConfigMode() {\n";
+    html += "            configMode = !configMode;\n";
+    html += "            var btn = document.getElementById('toggleConfigBtn');\n";
+    html += "            var container = document.getElementById('deviceContainer');\n";
+    html += "            \n";
+    html += "            if (configMode) {\n";
+    html += "                btn.textContent = 'Exit Shielding Config Mode';\n";
+    html += "                btn.style.backgroundColor = '#f44336';\n";
+    html += "                container.classList.add('config-mode-active');\n";
+    html += "                document.querySelectorAll('.input-item').forEach(item => item.classList.add('clickable'));\n";
+    html += "                showStatusMessage('Shielding Config Mode: Click points to toggle shielding', 'success');\n";
+    html += "            } else {\n";
+    html += "                btn.textContent = 'Enter Shielding Config Mode';\n";
+    html += "                btn.style.backgroundColor = '#ff9800';\n";
+    html += "                container.classList.remove('config-mode-active');\n";
+    html += "                document.querySelectorAll('.input-item').forEach(item => item.classList.remove('clickable'));\n";
+    html += "            }\n";
+    html += "        }\n";
+    html += "\n";
+    html += "        function toggleShielding(deviceId, inputId) {\n";
+    html += "            if (!configMode) return;\n";
+    html += "            \n";
+    html += "            var stateElement = document.getElementById('device-' + deviceId + '-input-' + inputId);\n";
+    html += "            var isCurrentlyShielded = stateElement.classList.contains('state-shielded');\n";
+    html += "            \n";
+    html += "            fetch('/api/shielding', {\n";
+    html += "                method: 'POST', \n";
+    html += "                headers: { 'Content-Type': 'application/json' },\n";
+    html += "                body: JSON.stringify({ device: deviceId, input: inputId, shielded: !isCurrentlyShielded })\n";
+    html += "            })\n";
+    html += "            .then(res => res.json())\n";
+    html += "            .then(data => {\n";
+    html += "                if (data.status === 'ok') {\n";
+    html += "                    if (!isCurrentlyShielded) stateElement.classList.add('state-shielded');\n";
+    html += "                    else stateElement.classList.remove('state-shielded');\n";
+    html += "                }\n";
     html += "            });\n";
     html += "        }\n";
     html += "\n";
@@ -576,7 +686,12 @@ String LaserWebServer::getHTMLPage() {
     html += "                    if (inputGrid.children.length === 0) {\n";
     html += "                        for (var inputId = 1; inputId <= 48; inputId++) {\n";
     html += "                            var inputItem = document.createElement('div');\n";
-    html += "                            inputItem.className = 'input-item';\n";
+    html += "                            inputItem.className = 'input-item' + (configMode ? ' clickable' : '');\n";
+    html += "                            var dId = deviceId;\n";
+    html += "                            var iId = inputId;\n";
+    html += "                            inputItem.onclick = function() { toggleShielding(this.dataset.device, this.dataset.input); };\n";
+    html += "                            inputItem.dataset.device = deviceId;\n";
+    html += "                            inputItem.dataset.input = inputId;\n";
     html += "                            inputItem.innerHTML = \n";
     html += "                                '<div class=\"input-id\">' + inputId + '</div>' +\n";
     html += "                                '<div class=\"input-state\" id=\"device-' + deviceId + '-input-' + inputId + '\"></div>';\n";
@@ -593,6 +708,9 @@ String LaserWebServer::getHTMLPage() {
     html += "                                stateElement.className = 'input-state state-active';\n";
     html += "                            } else {\n";
     html += "                                stateElement.className = 'input-state state-inactive';\n";
+    html += "                            }\n";
+    html += "                            if (input.shielded === 1) {\n";
+    html += "                                stateElement.classList.add('state-shielded');\n";
     html += "                            }\n";
     html += "                        }\n";
     html += "                    }\n";
@@ -625,4 +743,38 @@ String LaserWebServer::getBaselineDelayJSON() {
     String output;
     serializeJson(doc, output);
     return output;
+}
+
+void LaserWebServer::setShielding(uint8_t deviceAddr, uint8_t inputNum, bool shielded) {
+    if(deviceAddr >= 1 && deviceAddr <= 4 && inputNum >= 1 && inputNum <= 48) {
+        shieldedPoints[deviceAddr-1][inputNum-1] = shielded ? 1 : 0;
+        
+        // 关键：这里需要通知 main.cpp 保存到 Flash
+        // 由于本类目前不直接持有 Preferences，我们假设 main 会轮询或通过回调
+        // 实际上我们可以通过外部传入的指针直接修改 main 的 shielding 数组
+    }
+}
+
+bool LaserWebServer::isShielded(uint8_t deviceAddr, uint8_t inputNum) {
+    if(deviceAddr >= 1 && deviceAddr <= 4 && inputNum >= 1 && inputNum <= 48) {
+        return shieldedPoints[deviceAddr-1][inputNum-1] == 1;
+    }
+    return false;
+}
+
+String LaserWebServer::getShieldingJSON() {
+    DynamicJsonDocument doc(2048);
+    for(int d = 0; d < 4; d++) {
+        JsonArray deviceArr = doc.createNestedArray("device" + String(d+1));
+        for(int i = 0; i < 48; i++) {
+            deviceArr.add(shieldedPoints[d][i]);
+        }
+    }
+    String output;
+    serializeJson(doc, output);
+    return output;
+}
+
+void LaserWebServer::loadShielding(uint8_t shielding[4][48]) {
+    memcpy(shieldedPoints, shielding, sizeof(shieldedPoints));
 }

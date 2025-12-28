@@ -4,6 +4,7 @@
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <cstring>
+#include <Preferences.h> 
 
 // ============== RS485 引脚定义 ==============
 #define RS485_TX_PIN 17
@@ -44,6 +45,11 @@ const int DEVICE_TOLERANCE[NUM_DEVICES] = { 1, 1, 1, 1 };
 //    注意：扫描间隔约 30ms，设置为 3 大约意味着持续遮挡 90ms 才报警。
 const int DEVICE_DEBOUNCE[NUM_DEVICES]  = { 2, 2, 2, 2 };
 
+unsigned long baselineDelay = 200;  // 基线设定延时 (ms)       
+unsigned long scanInterval = 30;    // 扫描间隔 (ms)        
+unsigned long baselineScanInterval = 20;    // 基线扫描间隔 (ms)
+unsigned long baselineStableTime = 50;      // 基线稳定时间 (ms) 
+
 // ==============================================================================
 
 // ============== 系统状态机 ==============
@@ -58,6 +64,8 @@ enum SystemState {
   BASELINE_ACTIVE
 };
 SystemState currentState = ACTIVE;
+Preferences preferences; 
+uint8_t globalShielding[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]; 
 
 // ============== 全局对象 ==============
 HardwareSerial rs485Serial(1);
@@ -84,12 +92,30 @@ int baselineDeviceCounts[NUM_DEVICES];
 // [新增] 存储每个设备当前的连续异常计数
 int currentConsecutiveErrors[NUM_DEVICES];
 
-unsigned long baselineDelay = 200;       
-unsigned long scanInterval = 30;         
-unsigned long baselineScanInterval = 20; 
-unsigned long baselineStableTime = 50;   
+
 
 bool triggerSent = false;
+
+// [新增] 加载/保存屏蔽配置
+void loadShieldingConfig() {
+  preferences.begin("shielding", false);
+  size_t read = preferences.getBytes("mask", globalShielding, sizeof(globalShielding));
+  if (read != sizeof(globalShielding)) {
+    memset(globalShielding, 0, sizeof(globalShielding));
+    Serial.println("No shielding config found, initialized to 0");
+  } else {
+    Serial.println("Shielding config loaded from Flash");
+  }
+  preferences.end();
+  webServer.loadShielding(globalShielding);
+}
+
+void saveShieldingConfig() {
+  preferences.begin("shielding", false);
+  preferences.putBytes("mask", globalShielding, sizeof(globalShielding));
+  preferences.end();
+  Serial.println("Shielding config saved to Flash");
+}
 
 void setup_wifi() {
   delay(10);
@@ -238,15 +264,19 @@ void printDeviceData(const char *label, uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_
 int countActiveBits(uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
   int cnt = 0;
   for (int d = 0; d < NUM_DEVICES; d++)
-    for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++)
+    for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+      if (globalShielding[d][i]) continue; // [新增]
       if (arr[d][i])
         cnt++;
+    }
   return cnt;
 }
 
-int countSingleDeviceBits(uint8_t *deviceArr) {
+int countSingleDeviceBits(int deviceIdx, uint8_t *deviceArr) {
   int cnt = 0;
   for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+    // [新增] 如果该点被屏蔽，不计入有效点数
+    if (globalShielding[deviceIdx][i]) continue;
     if (deviceArr[i]) cnt++;
   }
   return cnt;
@@ -285,6 +315,9 @@ void calculateFinalBaseline() {
   for (int d = 0; d < NUM_DEVICES; d++) {
     int deviceBits = 0;
     for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+      // [新增] 跳过屏蔽点
+      if (globalShielding[d][i]) continue;
+      
       if (init_0[d][i] && init_1[d][i] && init_2[d][i]) {
         baseline[d][i] = 1;
         deviceBits++;
@@ -332,7 +365,7 @@ bool checkForChanges() {
 
   // 3. 逐个设备独立判断
   for (int d = 0; d < NUM_DEVICES; d++) {
-    int currentCount = countSingleDeviceBits(currentScan[d]);
+    int currentCount = countSingleDeviceBits(d, currentScan[d]);
     int baselineCount = baselineDeviceCounts[d];
     
     // 计算缺失点数 (基线 - 当前)
@@ -412,6 +445,8 @@ void setup() {
 
   webServer.begin();
 
+  loadShieldingConfig(); // [新增] 加载配置
+
   currentState = ACTIVE;
   Serial.println("System ready.");
 }
@@ -429,6 +464,25 @@ void loop() {
   switch (currentState) {
   case IDLE: break;
   case ACTIVE: break;
+
+  // [新增] 定时从 WebServer 同步并保存配置 (如果有更优雅的回调更好，这里采用轮询同步)
+  static unsigned long lastSyncTime = 0;
+  if (now - lastSyncTime > 1000) {
+    bool changed = false;
+    for(int d=0; d<NUM_DEVICES; d++) {
+      for(int i=0; i<NUM_INPUTS_PER_DEVICE; i++) {
+        uint8_t val = webServer.isShielded(d+1, i+1) ? 1 : 0;
+        if (globalShielding[d][i] != val) {
+          globalShielding[d][i] = val;
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      saveShieldingConfig();
+    }
+    lastSyncTime = now;
+  }
 
   case BASELINE_WAITING:
     if (now >= baselineSetTime) {
