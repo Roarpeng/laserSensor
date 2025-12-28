@@ -118,7 +118,7 @@ void LaserWebServer::broadcastStates() {
 }
 
 String LaserWebServer::getDeviceStatesJSON() {
-    DynamicJsonDocument doc(2048);
+    DynamicJsonDocument doc(8192);
     
     for(int device = 1; device <= 4; device++) {
         String deviceKey = "device" + String(device);

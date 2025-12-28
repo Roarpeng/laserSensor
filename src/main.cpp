@@ -361,6 +361,12 @@ bool checkForChanges() {
   if (millis() - lastLogTime > 200) {
     printDeviceData("MONITOR SCAN", currentScan);
     lastLogTime = millis();
+    
+    // [新增] 同步数据到 WebServer 并广播
+    for(int d=1; d<=NUM_DEVICES; d++) {
+      webServer.updateAllDeviceStates(d, currentScan[d-1]);
+    }
+    webServer.broadcastStates();
   }
 
   // 3. 逐个设备独立判断
@@ -500,6 +506,10 @@ void loop() {
         return;
       }
       Serial.printf("Scan #0 completed: %d active bits\n", countActiveBits(init_0));
+      // [新增] 同步初始扫描到 WebServer
+      for(int d=1; d<=NUM_DEVICES; d++) webServer.updateAllDeviceStates(d, init_0[d-1]);
+      webServer.broadcastStates();
+      
       Serial.println("\n=== BASELINE SCAN #1 ===");
       currentState = BASELINE_INIT_1;
       baselineSetTime = millis() + baselineScanInterval;
