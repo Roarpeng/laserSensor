@@ -4,6 +4,7 @@
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <cstring>
+#include <Preferences.h> 
 
 // ============== RS485 引脚定义 ==============
 #define RS485_TX_PIN 17
@@ -42,7 +43,7 @@ const int DEVICE_TOLERANCE[NUM_DEVICES] = {1, 1, 1, 1};
 //    数组顺序：{设备1设置, 设备2设置, 设备3设置, 设备4设置}
 //    建议：需要极快响应设为 1 或 2，需要极高抗干扰设为 3 到 5。
 //    注意：扫描间隔约 30ms，设置为 3 大约意味着持续遮挡 90ms 才报警。
-const int DEVICE_DEBOUNCE[NUM_DEVICES] = {2, 2, 2, 2};
+const int DEVICE_DEBOUNCE[NUM_DEVICES]  = { 2, 2, 2, 2 };
 
 // ==============================================================================
 
@@ -58,6 +59,8 @@ enum SystemState {
   BASELINE_ACTIVE
 };
 SystemState currentState = ACTIVE;
+Preferences preferences; 
+uint8_t globalShielding[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]; 
 
 // ============== 全局对象 ==============
 HardwareSerial rs485Serial(1);
@@ -84,12 +87,33 @@ int baselineDeviceCounts[NUM_DEVICES];
 // [新增] 存储每个设备当前的连续异常计数
 int currentConsecutiveErrors[NUM_DEVICES];
 
-unsigned long baselineDelay = 200;
-unsigned long scanInterval = 30;
-unsigned long baselineScanInterval = 20;
-unsigned long baselineStableTime = 50;
+unsigned long baselineDelay = 200;       
+unsigned long scanInterval = 30;         
+unsigned long baselineScanInterval = 20; 
+unsigned long baselineStableTime = 50;   
 
 bool triggerSent = false;
+
+// [新增] 加载/保存屏蔽配置
+void loadShieldingConfig() {
+  preferences.begin("shielding", false);
+  size_t read = preferences.getBytes("mask", globalShielding, sizeof(globalShielding));
+  if (read != sizeof(globalShielding)) {
+    memset(globalShielding, 0, sizeof(globalShielding));
+    Serial.println("No shielding config found, initialized to 0");
+  } else {
+    Serial.println("Shielding config loaded from Flash");
+  }
+  preferences.end();
+  webServer.loadShielding(globalShielding);
+}
+
+void saveShieldingConfig() {
+  preferences.begin("shielding", false);
+  preferences.putBytes("mask", globalShielding, sizeof(globalShielding));
+  preferences.end();
+  Serial.println("Shielding config saved to Flash");
+}
 
 void setup_wifi() {
   delay(10);
@@ -245,17 +269,18 @@ void printDeviceData(const char *label,
 int countActiveBits(uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
   int cnt = 0;
   for (int d = 0; d < NUM_DEVICES; d++)
-    for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++)
+    for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+      if (globalShielding[d][i]) continue; // [新增]
       if (arr[d][i])
         cnt++;
+    }
   return cnt;
 }
 
-int countSingleDeviceBits(uint8_t *deviceArr) {
+int countSingleDeviceBits(int deviceIdx, uint8_t *deviceArr) {
   int cnt = 0;
   for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
-    if (deviceArr[i])
-      cnt++;
+    if (deviceArr[i]) cnt++;
   }
   return cnt;
 }
@@ -296,6 +321,9 @@ void calculateFinalBaseline() {
   for (int d = 0; d < NUM_DEVICES; d++) {
     int deviceBits = 0;
     for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+      // [新增] 跳过屏蔽点
+      if (globalShielding[d][i]) continue;
+      
       if (init_0[d][i] && init_1[d][i] && init_2[d][i]) {
         baseline[d][i] = 1;
         deviceBits++;
@@ -341,26 +369,21 @@ bool checkForChanges() {
   if (millis() - lastLogTime > 200) {
     printDeviceData("MONITOR SCAN", currentScan);
     lastLogTime = millis();
+    
+    // [新增] 同步数据到 WebServer 并广播
+    for(int d=1; d<=NUM_DEVICES; d++) {
+      webServer.updateAllDeviceStates(d, currentScan[d-1]);
+    }
+    webServer.broadcastStates();
   }
 
   // 3. 逐个设备独立判断
   for (int d = 0; d < NUM_DEVICES; d++) {
-    int validCurrentCount = 0;
-    int validBaselineCount = 0;
-
-    // Calculate effective counts (ignoring shielded bits)
-    for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
-      bool isShielded = webServer.getShieldState(d + 1, i + 1);
-      if (!isShielded) {
-        if (currentScan[d][i])
-          validCurrentCount++;
-        if (baseline[d][i])
-          validBaselineCount++;
-      }
-    }
-
-    // 计算缺失点数 (有效基线 - 有效当前)
-    int diff = validBaselineCount - validCurrentCount;
+    int currentCount = countSingleDeviceBits(currentScan[d]);
+    int baselineCount = baselineDeviceCounts[d];
+    
+    // 计算缺失点数 (基线 - 当前)
+    int diff = baselineCount - currentCount;
 
     // 获取该设备的配置参数
     int myTolerance = DEVICE_TOLERANCE[d];
@@ -439,6 +462,8 @@ void setup() {
 
   webServer.begin();
 
+  loadShieldingConfig(); // [新增] 加载配置
+
   currentState = ACTIVE;
   Serial.println("System ready.");
 }
@@ -454,10 +479,8 @@ void loop() {
   unsigned long now = millis();
 
   switch (currentState) {
-  case IDLE:
-    break;
-  case ACTIVE:
-    break;
+  case IDLE: break;
+  case ACTIVE: break;
 
   case BASELINE_WAITING:
     if (now >= baselineSetTime) {
@@ -474,8 +497,7 @@ void loop() {
         currentState = ACTIVE;
         return;
       }
-      Serial.printf("Scan #0 completed: %d active bits\n",
-                    countActiveBits(init_0));
+      Serial.printf("Scan #0 completed: %d active bits\n", countActiveBits(init_0));
       Serial.println("\n=== BASELINE SCAN #1 ===");
       currentState = BASELINE_INIT_1;
       baselineSetTime = millis() + baselineScanInterval;
