@@ -35,14 +35,14 @@ const char *debug_printBaseline_topic = "debug/printBaseline";
 //    含义：该设备当前有效点数比基线少多少时，视为“异常”。
 //    数组顺序：{设备1设置, 设备2设置, 设备3设置, 设备4设置}
 //    建议：环境好的设备设为 1，灰尘多或不重要的设备设为 2 或 3。
-const int DEVICE_TOLERANCE[NUM_DEVICES] = { 1, 1, 1, 1 }; 
+const int DEVICE_TOLERANCE[NUM_DEVICES] = {1, 1, 1, 1};
 
 // 2. [独立去抖] 连续确认次数 (Debounce)
 //    含义：该设备必须“连续”多少次扫描都处于异常状态，才触发最终报警。
 //    数组顺序：{设备1设置, 设备2设置, 设备3设置, 设备4设置}
 //    建议：需要极快响应设为 1 或 2，需要极高抗干扰设为 3 到 5。
 //    注意：扫描间隔约 30ms，设置为 3 大约意味着持续遮挡 90ms 才报警。
-const int DEVICE_DEBOUNCE[NUM_DEVICES]  = { 2, 2, 2, 2 };
+const int DEVICE_DEBOUNCE[NUM_DEVICES] = {2, 2, 2, 2};
 
 // ==============================================================================
 
@@ -79,15 +79,15 @@ uint8_t init_1[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 uint8_t init_2[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 
 // 存储每个设备独立的基线总点数
-int baselineDeviceCounts[NUM_DEVICES]; 
+int baselineDeviceCounts[NUM_DEVICES];
 
 // [新增] 存储每个设备当前的连续异常计数
 int currentConsecutiveErrors[NUM_DEVICES];
 
-unsigned long baselineDelay = 200;       
-unsigned long scanInterval = 30;         
-unsigned long baselineScanInterval = 20; 
-unsigned long baselineStableTime = 50;   
+unsigned long baselineDelay = 200;
+unsigned long scanInterval = 30;
+unsigned long baselineScanInterval = 20;
+unsigned long baselineStableTime = 50;
 
 bool triggerSent = false;
 
@@ -130,8 +130,9 @@ void callback(char *topic, byte *payload, unsigned int length) {
   }
 
   if (strcmp(topic, changeState_topic) == 0) {
-    if (currentState == IDLE) return;
-    
+    if (currentState == IDLE)
+      return;
+
     if (currentState >= BASELINE_WAITING && currentState <= BASELINE_CALC) {
       return;
     }
@@ -140,10 +141,11 @@ void callback(char *topic, byte *payload, unsigned int length) {
     currentState = BASELINE_WAITING;
     baselineSetTime = millis() + baselineDelay;
     triggerSent = false;
-    
+
     // 重置所有设备的计数器
-    for(int i=0; i<NUM_DEVICES; i++) currentConsecutiveErrors[i] = 0;
-    
+    for (int i = 0; i < NUM_DEVICES; i++)
+      currentConsecutiveErrors[i] = 0;
+
     return;
   }
 }
@@ -181,7 +183,8 @@ bool readInputStatus(uint8_t deviceAddress, uint8_t *status_array) {
     rs485Serial.read();
   }
 
-  uint8_t request[] = {deviceAddress, 0x02, 0x00, 0x00, 0x00, NUM_INPUTS_PER_DEVICE};
+  uint8_t request[] = {deviceAddress, 0x02, 0x00,
+                       0x00,          0x00, NUM_INPUTS_PER_DEVICE};
   uint16_t crc = crc16(request, sizeof(request));
 
   uint8_t full_request[sizeof(request) + 2];
@@ -195,11 +198,12 @@ bool readInputStatus(uint8_t deviceAddress, uint8_t *status_array) {
   uint8_t response[responseLength];
 
   unsigned long startMicros = micros();
-  const unsigned long timeoutMicros = 50000; 
+  const unsigned long timeoutMicros = 50000;
 
   while (rs485Serial.available() < responseLength) {
     if (micros() - startMicros > timeoutMicros) {
-      while (rs485Serial.available()) rs485Serial.read();
+      while (rs485Serial.available())
+        rs485Serial.read();
       return false;
     }
     delayMicroseconds(50);
@@ -207,10 +211,12 @@ bool readInputStatus(uint8_t deviceAddress, uint8_t *status_array) {
 
   rs485Serial.readBytes(response, responseLength);
 
-  uint16_t crc_rx = (response[responseLength - 1] << 8) | response[responseLength - 2];
+  uint16_t crc_rx =
+      (response[responseLength - 1] << 8) | response[responseLength - 2];
   uint16_t crc_calc = crc16(response, responseLength - 2);
 
-  if (crc_rx != crc_calc) return false;
+  if (crc_rx != crc_calc)
+    return false;
 
   uint8_t byte_count = response[2];
   for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
@@ -224,7 +230,8 @@ bool readInputStatus(uint8_t deviceAddress, uint8_t *status_array) {
   return true;
 }
 
-void printDeviceData(const char *label, uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
+void printDeviceData(const char *label,
+                     uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
   Serial.printf("\n=== %s ===\n", label);
   for (int d = 1; d <= NUM_DEVICES; d++) {
     Serial.printf("Device %d: ", d);
@@ -247,7 +254,8 @@ int countActiveBits(uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
 int countSingleDeviceBits(uint8_t *deviceArr) {
   int cnt = 0;
   for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
-    if (deviceArr[i]) cnt++;
+    if (deviceArr[i])
+      cnt++;
   }
   return cnt;
 }
@@ -260,15 +268,17 @@ bool scanBaseline(uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
         success = true;
         break;
       }
-      Serial.printf("Warning: Device %d read failed, retrying (%d/3)...\n", d, retry + 1);
-      delay(10); 
+      Serial.printf("Warning: Device %d read failed, retrying (%d/3)...\n", d,
+                    retry + 1);
+      delay(10);
     }
 
     if (!success) {
-      Serial.printf("Error: Baseline scan failed PERMANENTLY at Device %d\n", d);
-      return false; 
+      Serial.printf("Error: Baseline scan failed PERMANENTLY at Device %d\n",
+                    d);
+      return false;
     }
-    delay(3); 
+    delay(3);
   }
   return true;
 }
@@ -276,9 +286,10 @@ bool scanBaseline(uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
 void calculateFinalBaseline() {
   memset(baseline, 0, sizeof(baseline));
   memset(baselineDeviceCounts, 0, sizeof(baselineDeviceCounts));
-  
+
   // 清零状态计数器
-  for(int i=0; i<NUM_DEVICES; i++) currentConsecutiveErrors[i] = 0;
+  for (int i = 0; i < NUM_DEVICES; i++)
+    currentConsecutiveErrors[i] = 0;
 
   int totalBits = 0;
 
@@ -292,7 +303,7 @@ void calculateFinalBaseline() {
     }
     baselineDeviceCounts[d] = deviceBits;
     totalBits += deviceBits;
-    
+
     Serial.printf("Device %d Baseline Bits: %d\n", d + 1, deviceBits);
   }
 
@@ -321,6 +332,8 @@ bool checkForChanges() {
       lastReadFailTime = millis();
       return false;
     }
+    // Update WebUI with real-time status
+    webServer.updateAllDeviceStates(d, currentScan[d - 1]);
     delay(3);
   }
 
@@ -332,11 +345,22 @@ bool checkForChanges() {
 
   // 3. 逐个设备独立判断
   for (int d = 0; d < NUM_DEVICES; d++) {
-    int currentCount = countSingleDeviceBits(currentScan[d]);
-    int baselineCount = baselineDeviceCounts[d];
-    
-    // 计算缺失点数 (基线 - 当前)
-    int diff = baselineCount - currentCount;
+    int validCurrentCount = 0;
+    int validBaselineCount = 0;
+
+    // Calculate effective counts (ignoring shielded bits)
+    for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+      bool isShielded = webServer.getShieldState(d + 1, i + 1);
+      if (!isShielded) {
+        if (currentScan[d][i])
+          validCurrentCount++;
+        if (baseline[d][i])
+          validBaselineCount++;
+      }
+    }
+
+    // 计算缺失点数 (有效基线 - 有效当前)
+    int diff = validBaselineCount - validCurrentCount;
 
     // 获取该设备的配置参数
     int myTolerance = DEVICE_TOLERANCE[d];
@@ -347,8 +371,9 @@ bool checkForChanges() {
       // 增加该设备的连续异常计数
       currentConsecutiveErrors[d]++;
 
-      Serial.printf(">> Dev %d ALARM: Missing %d (Thresh %d). Count %d/%d\n", 
-                    d+1, diff, myTolerance, currentConsecutiveErrors[d], myDebounceTarget);
+      Serial.printf(">> Dev %d ALARM: Missing %d (Thresh %d). Count %d/%d\n",
+                    d + 1, diff, myTolerance, currentConsecutiveErrors[d],
+                    myDebounceTarget);
 
       // 检查是否达到该设备的确认次数
       if (currentConsecutiveErrors[d] >= myDebounceTarget) {
@@ -360,7 +385,7 @@ bool checkForChanges() {
     } else {
       // 如果该设备本次正常（或误差在容差内），重置该设备的计数器
       if (currentConsecutiveErrors[d] > 0) {
-        Serial.printf("Dev %d recovered (Count reset)\n", d+1);
+        Serial.printf("Dev %d recovered (Count reset)\n", d + 1);
       }
       currentConsecutiveErrors[d] = 0;
     }
@@ -371,7 +396,8 @@ bool checkForChanges() {
     Serial.println(">>> TRIGGER CONFIRMED (By at least one device) <<<");
     // 重置所有计数器？或者保留？
     // 这里选择重置，以便下一个周期重新检测
-    for(int i=0; i<NUM_DEVICES; i++) currentConsecutiveErrors[i] = 0;
+    for (int i = 0; i < NUM_DEVICES; i++)
+      currentConsecutiveErrors[i] = 0;
     return true;
   }
 
@@ -379,7 +405,8 @@ bool checkForChanges() {
 }
 
 void handleTriggerDetected() {
-  if (triggerSent) return;
+  if (triggerSent)
+    return;
 
   if (!client.connected()) {
     Serial.println("Trigger pending - MQTT disconnected");
@@ -427,8 +454,10 @@ void loop() {
   unsigned long now = millis();
 
   switch (currentState) {
-  case IDLE: break;
-  case ACTIVE: break;
+  case IDLE:
+    break;
+  case ACTIVE:
+    break;
 
   case BASELINE_WAITING:
     if (now >= baselineSetTime) {
@@ -445,7 +474,8 @@ void loop() {
         currentState = ACTIVE;
         return;
       }
-      Serial.printf("Scan #0 completed: %d active bits\n", countActiveBits(init_0));
+      Serial.printf("Scan #0 completed: %d active bits\n",
+                    countActiveBits(init_0));
       Serial.println("\n=== BASELINE SCAN #1 ===");
       currentState = BASELINE_INIT_1;
       baselineSetTime = millis() + baselineScanInterval;
@@ -459,7 +489,8 @@ void loop() {
         currentState = ACTIVE;
         return;
       }
-      Serial.printf("Scan #1 completed: %d active bits\n", countActiveBits(init_1));
+      Serial.printf("Scan #1 completed: %d active bits\n",
+                    countActiveBits(init_1));
       Serial.println("\n=== BASELINE SCAN #2 ===");
       currentState = BASELINE_INIT_2;
       baselineSetTime = millis() + baselineScanInterval;
@@ -473,7 +504,8 @@ void loop() {
         currentState = ACTIVE;
         return;
       }
-      Serial.printf("Scan #2 completed: %d active bits\n", countActiveBits(init_2));
+      Serial.printf("Scan #2 completed: %d active bits\n",
+                    countActiveBits(init_2));
       Serial.println("\n=== CALCULATING FINAL BASELINE (AND Logic) ===");
       currentState = BASELINE_CALC;
     }
