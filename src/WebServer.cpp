@@ -124,7 +124,7 @@ void LaserWebServer::broadcastStates() {
 }
 
 String LaserWebServer::getDeviceStatesJSON() {
-  DynamicJsonDocument doc(2048);
+  DynamicJsonDocument doc(8192);
 
   for (int device = 1; device <= 4; device++) {
     String deviceKey = "device" + String(device);
@@ -560,7 +560,7 @@ bool LaserWebServer::getShieldState(uint8_t deviceAddr, uint8_t inputNum) {
 }
 
 String LaserWebServer::getShieldMaskJSON() {
-  DynamicJsonDocument doc(2048);
+  DynamicJsonDocument doc(4096);
 
   for (int device = 1; device <= 4; device++) {
     String deviceKey = "device" + String(device);
@@ -582,7 +582,8 @@ void LaserWebServer::loadShielding(uint8_t shielding[4][48]) {
   memcpy(shieldMask, shielding, sizeof(shieldMask));
 }
 
-void LaserWebServer::setShieldingChangeCallback(ShieldingChangeCallback callback) {
+void LaserWebServer::setShieldingChangeCallback(
+    ShieldingChangeCallback callback) {
   shieldingChangeCallback = callback;
   Serial.println("Shielding change callback registered");
 }

@@ -118,12 +118,32 @@ void saveShieldingConfig() {
   for (int d = 0; d < NUM_DEVICES; d++) {
     int deviceShielded = 0;
     for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
-      if (globalShielding[d][i]) deviceShielded++;
+      if (globalShielding[d][i])
+        deviceShielded++;
     }
     totalShielded += deviceShielded;
     Serial.printf("Device %d: %d points shielded\n", d + 1, deviceShielded);
   }
-  Serial.printf("Total: %d/192 points shielded, saved to Flash\n", totalShielded);
+  Serial.printf("Total: %d/192 points shielded, saved to Flash\n",
+                totalShielded);
+}
+
+// [新增] 重新计算每个设备的有效基线点数
+void recalculateBaselineCounts() {
+  int totalBits = 0;
+  for (int d = 0; d < NUM_DEVICES; d++) {
+    int deviceBits = 0;
+    for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+      // 只有物理上是1且没被屏蔽的才算基线
+      if (baseline[d][i] == 1 && !webServer.getShieldState(d + 1, i + 1)) {
+        deviceBits++;
+      }
+    }
+    baselineDeviceCounts[d] = deviceBits;
+    totalBits += deviceBits;
+    Serial.printf("Device %d Recalculated Baseline: %d\n", d + 1, deviceBits);
+  }
+  Serial.printf("Total Recalculated Baseline: %d / 192\n", totalBits);
 }
 
 // Callback handler for shielding changes from WebServer
@@ -138,8 +158,11 @@ void onShieldingChanged(uint8_t deviceAddr, uint8_t inputNum, bool state) {
     // Sync back to WebServer (fix refresh issue)
     webServer.loadShielding(globalShielding);
 
-    Serial.printf("Shield updated: Device %d, Input %d -> %s\n",
-                  deviceAddr, inputNum, state ? "SHIELDED" : "UNSHIELDED");
+    // [关键修复] 当屏蔽改变时，必须重新计算基线参考值，否则会触发误报
+    recalculateBaselineCounts();
+
+    Serial.printf("Shield updated: Device %d, Input %d -> %s\n", deviceAddr,
+                  inputNum, state ? "SHIELDED" : "UNSHIELDED");
   }
 }
 
@@ -352,24 +375,17 @@ void calculateFinalBaseline() {
   int totalBits = 0;
 
   for (int d = 0; d < NUM_DEVICES; d++) {
-    int deviceBits = 0;
     for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
-      // [新增] 跳过屏蔽点
-      if (globalShielding[d][i])
-        continue;
-
+      // 记录物理基线（不管是否屏蔽）
       if (init_0[d][i] && init_1[d][i] && init_2[d][i]) {
         baseline[d][i] = 1;
-        deviceBits++;
       }
     }
-    baselineDeviceCounts[d] = deviceBits;
-    totalBits += deviceBits;
-
-    Serial.printf("Device %d Baseline Bits: %d\n", d + 1, deviceBits);
   }
 
-  Serial.printf("Total baseline bits (Global): %d / 192\n", totalBits);
+  // 使用统一函数计算带屏蔽的 baselineDeviceCounts
+  recalculateBaselineCounts();
+
   printDeviceData("FINAL BASELINE", baseline);
 
   Serial.println("\n✓✓✓ BASELINE ESTABLISHED (Independent Config Mode) ✓✓✓");
@@ -499,8 +515,8 @@ void setup() {
 
   webServer.begin();
 
-  loadShieldingConfig();                    // [新增] 加载配置
-  webServer.loadShielding(globalShielding); // 同步到 WebServer
+  loadShieldingConfig();                                    // [新增] 加载配置
+  webServer.loadShielding(globalShielding);                 // 同步到 WebServer
   webServer.setShieldingChangeCallback(onShieldingChanged); // 注册回调
 
   currentState = ACTIVE;
