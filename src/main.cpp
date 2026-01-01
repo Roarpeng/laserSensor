@@ -1,10 +1,10 @@
 #include "WebServer.h"
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include <Preferences.h>
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <cstring>
-#include <Preferences.h> 
 
 // ============== RS485 引脚定义 ==============
 #define RS485_TX_PIN 17
@@ -43,8 +43,12 @@ const int DEVICE_TOLERANCE[NUM_DEVICES] = {1, 1, 1, 1};
 //    数组顺序：{设备1设置, 设备2设置, 设备3设置, 设备4设置}
 //    建议：需要极快响应设为 1 或 2，需要极高抗干扰设为 3 到 5。
 //    注意：扫描间隔约 30ms，设置为 3 大约意味着持续遮挡 90ms 才报警。
-const int DEVICE_DEBOUNCE[NUM_DEVICES]  = { 2, 2, 2, 2 };
+const int DEVICE_DEBOUNCE[NUM_DEVICES] = {2, 2, 2, 2};
 
+unsigned long baselineDelay = 350;       // 基线设置延迟，单位毫秒
+unsigned long scanInterval = 700;        // 扫描间隔，单位毫秒
+unsigned long baselineScanInterval = 35; // 基线扫描间隔，单位毫秒
+unsigned long baselineStableTime = 100;  // 基线稳定时间，单位毫秒
 // ==============================================================================
 
 // ============== 系统状态机 ==============
@@ -59,8 +63,8 @@ enum SystemState {
   BASELINE_ACTIVE
 };
 SystemState currentState = ACTIVE;
-Preferences preferences; 
-uint8_t globalShielding[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]; 
+Preferences preferences;
+uint8_t globalShielding[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
 
 // ============== 全局对象 ==============
 HardwareSerial rs485Serial(1);
@@ -87,17 +91,13 @@ int baselineDeviceCounts[NUM_DEVICES];
 // [新增] 存储每个设备当前的连续异常计数
 int currentConsecutiveErrors[NUM_DEVICES];
 
-unsigned long baselineDelay = 200;       
-unsigned long scanInterval = 30;         
-unsigned long baselineScanInterval = 20; 
-unsigned long baselineStableTime = 50;   
-
 bool triggerSent = false;
 
 // [新增] 加载/保存屏蔽配置
 void loadShieldingConfig() {
   preferences.begin("shielding", false);
-  size_t read = preferences.getBytes("mask", globalShielding, sizeof(globalShielding));
+  size_t read =
+      preferences.getBytes("mask", globalShielding, sizeof(globalShielding));
   if (read != sizeof(globalShielding)) {
     memset(globalShielding, 0, sizeof(globalShielding));
     Serial.println("No shielding config found, initialized to 0");
@@ -268,19 +268,24 @@ void printDeviceData(const char *label,
 
 int countActiveBits(uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
   int cnt = 0;
-  for (int d = 0; d < NUM_DEVICES; d++)
+  for (int d = 0; d < NUM_DEVICES; d++) {
     for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
-      if (globalShielding[d][i]) continue; // [新增]
+      if (webServer.getShieldState(d + 1, i + 1))
+        continue;
       if (arr[d][i])
         cnt++;
     }
+  }
   return cnt;
 }
 
 int countSingleDeviceBits(int deviceIdx, uint8_t *deviceArr) {
   int cnt = 0;
   for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
-    if (deviceArr[i]) cnt++;
+    if (webServer.getShieldState(deviceIdx + 1, i + 1))
+      continue;
+    if (deviceArr[i])
+      cnt++;
   }
   return cnt;
 }
@@ -322,8 +327,9 @@ void calculateFinalBaseline() {
     int deviceBits = 0;
     for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
       // [新增] 跳过屏蔽点
-      if (globalShielding[d][i]) continue;
-      
+      if (globalShielding[d][i])
+        continue;
+
       if (init_0[d][i] && init_1[d][i] && init_2[d][i]) {
         baseline[d][i] = 1;
         deviceBits++;
@@ -354,34 +360,37 @@ bool checkForChanges() {
   bool anyDeviceTriggered = false; // 只要有一个设备确认触发，就置为true
 
   // 1. 扫描所有设备
+  bool scanFailed = false;
   for (int d = 1; d <= NUM_DEVICES; d++) {
-    if (!readInputStatus(d, currentScan[d - 1])) {
+    if (readInputStatus(d, currentScan[d - 1])) {
+      // Update WebUI with real-time status as soon as we get it
+      webServer.updateAllDeviceStates(d, currentScan[d - 1]);
+    } else {
       Serial.printf("Monitor scan failed at Device %d\n", d);
-      lastReadFailTime = millis();
-      return false;
+      scanFailed = true;
+      // Initialize with zeros or keep old data if preferred, but here we'll
+      // zero it out for safety
+      memset(currentScan[d - 1], 0, NUM_INPUTS_PER_DEVICE);
     }
-    // Update WebUI with real-time status
-    webServer.updateAllDeviceStates(d, currentScan[d - 1]);
     delay(3);
   }
 
-  // 2. 打印日志 (每200ms)
+  if (scanFailed) {
+    lastReadFailTime = millis();
+  }
+
+  // 2. 打印日志 (每200ms) 并广播到 WebServer
   if (millis() - lastLogTime > 200) {
     printDeviceData("MONITOR SCAN", currentScan);
     lastLogTime = millis();
-    
-    // [新增] 同步数据到 WebServer 并广播
-    for(int d=1; d<=NUM_DEVICES; d++) {
-      webServer.updateAllDeviceStates(d, currentScan[d-1]);
-    }
     webServer.broadcastStates();
   }
 
   // 3. 逐个设备独立判断
   for (int d = 0; d < NUM_DEVICES; d++) {
-    int currentCount = countSingleDeviceBits(currentScan[d]);
+    int currentCount = countSingleDeviceBits(d, currentScan[d]);
     int baselineCount = baselineDeviceCounts[d];
-    
+
     // 计算缺失点数 (基线 - 当前)
     int diff = baselineCount - currentCount;
 
@@ -462,7 +471,8 @@ void setup() {
 
   webServer.begin();
 
-  loadShieldingConfig(); // [新增] 加载配置
+  loadShieldingConfig();                    // [新增] 加载配置
+  webServer.loadShielding(globalShielding); // 同步到 WebServer
 
   currentState = ACTIVE;
   Serial.println("System ready.");
@@ -479,8 +489,10 @@ void loop() {
   unsigned long now = millis();
 
   switch (currentState) {
-  case IDLE: break;
-  case ACTIVE: break;
+  case IDLE:
+    break;
+  case ACTIVE:
+    break;
 
   case BASELINE_WAITING:
     if (now >= baselineSetTime) {
@@ -497,7 +509,8 @@ void loop() {
         currentState = ACTIVE;
         return;
       }
-      Serial.printf("Scan #0 completed: %d active bits\n", countActiveBits(init_0));
+      Serial.printf("Scan #0 completed: %d active bits\n",
+                    countActiveBits(init_0));
       Serial.println("\n=== BASELINE SCAN #1 ===");
       currentState = BASELINE_INIT_1;
       baselineSetTime = millis() + baselineScanInterval;
