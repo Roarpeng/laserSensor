@@ -112,7 +112,35 @@ void saveShieldingConfig() {
   preferences.begin("shielding", false);
   preferences.putBytes("mask", globalShielding, sizeof(globalShielding));
   preferences.end();
-  Serial.println("Shielding config saved to Flash");
+
+  // Enhanced logging
+  int totalShielded = 0;
+  for (int d = 0; d < NUM_DEVICES; d++) {
+    int deviceShielded = 0;
+    for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+      if (globalShielding[d][i]) deviceShielded++;
+    }
+    totalShielded += deviceShielded;
+    Serial.printf("Device %d: %d points shielded\n", d + 1, deviceShielded);
+  }
+  Serial.printf("Total: %d/192 points shielded, saved to Flash\n", totalShielded);
+}
+
+// Callback handler for shielding changes from WebServer
+void onShieldingChanged(uint8_t deviceAddr, uint8_t inputNum, bool state) {
+  if (deviceAddr >= 1 && deviceAddr <= 4 && inputNum >= 1 && inputNum <= 48) {
+    // Update global storage
+    globalShielding[deviceAddr - 1][inputNum - 1] = state ? 1 : 0;
+
+    // Save to Flash immediately
+    saveShieldingConfig();
+
+    // Sync back to WebServer (fix refresh issue)
+    webServer.loadShielding(globalShielding);
+
+    Serial.printf("Shield updated: Device %d, Input %d -> %s\n",
+                  deviceAddr, inputNum, state ? "SHIELDED" : "UNSHIELDED");
+  }
 }
 
 void setup_wifi() {
@@ -473,6 +501,7 @@ void setup() {
 
   loadShieldingConfig();                    // [新增] 加载配置
   webServer.loadShielding(globalShielding); // 同步到 WebServer
+  webServer.setShieldingChangeCallback(onShieldingChanged); // 注册回调
 
   currentState = ACTIVE;
   Serial.println("System ready.");

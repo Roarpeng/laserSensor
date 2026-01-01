@@ -41,8 +41,15 @@ public:
   String getShieldMaskJSON();
   void loadShielding(uint8_t shielding[4][48]);
 
+  // Shielding change callback type
+  typedef void (*ShieldingChangeCallback)(uint8_t deviceAddr, uint8_t inputNum, bool state);
+
+  // Set callback for shielding changes
+  void setShieldingChangeCallback(ShieldingChangeCallback callback);
+
 private:
   uint8_t shieldMask[4][48]; // To store shielding state locally in WebServer
+  ShieldingChangeCallback shieldingChangeCallback;
 };
 
 #endif

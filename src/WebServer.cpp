@@ -7,6 +7,7 @@ LaserWebServer::LaserWebServer() : server(80) {
   isWebServerRunning = false;
   clientCount = 0;
   baselineDelay = 200; // 默认200ms延迟
+  shieldingChangeCallback = nullptr;
 
   // 初始化所有设备状态为0
   for (int i = 0; i < 4; i++) {
@@ -541,7 +542,13 @@ String LaserWebServer::getBaselineDelayJSON() {
 void LaserWebServer::setShieldState(uint8_t deviceAddr, uint8_t inputNum,
                                     bool state) {
   if (deviceAddr >= 1 && deviceAddr <= 4 && inputNum >= 1 && inputNum <= 48) {
+    uint8_t oldState = shieldMask[deviceAddr - 1][inputNum - 1];
     shieldMask[deviceAddr - 1][inputNum - 1] = state ? 1 : 0;
+
+    // Trigger callback only if state actually changed
+    if (oldState != (state ? 1 : 0) && shieldingChangeCallback != nullptr) {
+      shieldingChangeCallback(deviceAddr, inputNum, state);
+    }
   }
 }
 
@@ -573,4 +580,9 @@ String LaserWebServer::getShieldMaskJSON() {
 
 void LaserWebServer::loadShielding(uint8_t shielding[4][48]) {
   memcpy(shieldMask, shielding, sizeof(shieldMask));
+}
+
+void LaserWebServer::setShieldingChangeCallback(ShieldingChangeCallback callback) {
+  shieldingChangeCallback = callback;
+  Serial.println("Shielding change callback registered");
 }
