@@ -309,9 +309,17 @@ void printDeviceData(const char *label,
                      uint8_t arr[NUM_DEVICES][NUM_INPUTS_PER_DEVICE]) {
   Serial.printf("\n=== %s ===\n", label);
   for (int d = 1; d <= NUM_DEVICES; d++) {
+    // Print physical state
     Serial.printf("Device %d: ", d);
     for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
       Serial.print(arr[d - 1][i]);
+    }
+    Serial.println();
+
+    // Print shielding mask (debug)
+    Serial.printf("Shield %d: ", d);
+    for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+      Serial.print(webServer.getShieldState(d, i + 1) ? 'X' : '-');
     }
     Serial.println();
   }
@@ -430,40 +438,71 @@ bool checkForChanges() {
     webServer.broadcastStates();
   }
 
-  // 3. 逐个设备独立判断
+  // 3. 逐个设备独立判断 (使用逐位比较)
   for (int d = 0; d < NUM_DEVICES; d++) {
-    int currentCount = countSingleDeviceBits(d, currentScan[d]);
-    int baselineCount = baselineDeviceCounts[d];
+    // 逐位比较：计算 (baseline AND NOT shield) vs (current AND NOT shield)
+    // 只有当 maskedBaseline[i]==1 且 maskedCurrent[i]==0 时才算缺失
+    int missingBits = 0;
+    for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+      bool isShielded = webServer.getShieldState(d + 1, i + 1);
+      // 应用屏蔽：屏蔽位强制为0
+      uint8_t maskedBaseline = isShielded ? 0 : baseline[d][i];
+      uint8_t maskedCurrent = isShielded ? 0 : currentScan[d][i];
 
-    // 计算缺失点数 (基线 - 当前)
-    int diff = baselineCount - currentCount;
+      // 只有基线为1且当前为0才算缺失
+      if (maskedBaseline == 1 && maskedCurrent == 0) {
+        missingBits++;
+      }
+    }
+
+    // [调试日志] 每2秒打印一次详细的对比数据
+    static unsigned long lastDebugLog = 0;
+    if (millis() - lastDebugLog > 2000) {
+      Serial.printf("[DEBUG] Dev %d: MissingBits=%d (bitwise)\n", d + 1,
+                    missingBits);
+    }
 
     // 获取该设备的配置参数
     int myTolerance = DEVICE_TOLERANCE[d];
     int myDebounceTarget = DEVICE_DEBOUNCE[d];
 
-    // 判断逻辑：当前设备缺失数 >= 该设备的容差
-    if (diff >= myTolerance) {
-      // 增加该设备的连续异常计数
+    // 判断逻辑：缺失位数 >= 容差
+    if (missingBits >= myTolerance) {
       currentConsecutiveErrors[d]++;
 
-      Serial.printf(">> Dev %d ALARM: Missing %d (Thresh %d). Count %d/%d\n",
-                    d + 1, diff, myTolerance, currentConsecutiveErrors[d],
-                    myDebounceTarget);
+      Serial.printf(
+          ">> Dev %d ALARM: Missing %d bits (Thresh %d). Count %d/%d\n", d + 1,
+          missingBits, myTolerance, currentConsecutiveErrors[d],
+          myDebounceTarget);
 
-      // 检查是否达到该设备的确认次数
+      // [诊断] 首次报警时，打印具体缺失的位置
+      if (currentConsecutiveErrors[d] == 1) {
+        Serial.printf("   Missing positions: ");
+        for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
+          bool isShielded = webServer.getShieldState(d + 1, i + 1);
+          uint8_t maskedBaseline = isShielded ? 0 : baseline[d][i];
+          uint8_t maskedCurrent = isShielded ? 0 : currentScan[d][i];
+          if (maskedBaseline == 1 && maskedCurrent == 0) {
+            Serial.printf("%d ", i + 1);
+          }
+        }
+        Serial.println();
+      }
+
       if (currentConsecutiveErrors[d] >= myDebounceTarget) {
-        anyDeviceTriggered = true; // 标记触发
-        // 注意：这里不重置计数器，或者重置都可以。
-        // 为了防止连续发MQTT，通常在 handleTriggerDetected 里控制
+        anyDeviceTriggered = true;
       }
 
     } else {
-      // 如果该设备本次正常（或误差在容差内），重置该设备的计数器
       if (currentConsecutiveErrors[d] > 0) {
         Serial.printf("Dev %d recovered (Count reset)\n", d + 1);
       }
       currentConsecutiveErrors[d] = 0;
+    }
+
+    // Reset debug timer after all devices logged
+    if (d == NUM_DEVICES - 1 && millis() - lastDebugLog > 2000) {
+      lastDebugLog = millis();
     }
   }
 
