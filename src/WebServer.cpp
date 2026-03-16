@@ -7,7 +7,10 @@ LaserWebServer::LaserWebServer() : server(80) {
   isWebServerRunning = false;
   clientCount = 0;
   baselineDelay = 200; // 默认200ms延迟
+  triggerFilterThreshold = 20; // 默认20个点
   shieldingChangeCallback = nullptr;
+  clearShieldingCallback = nullptr;
+  triggerFilterCallback = nullptr;
 
   // 初始化所有设备状态为0
   for (int i = 0; i < 4; i++) {
@@ -222,6 +225,12 @@ void LaserWebServer::handleHTTPRequest(WiFiClient &client, int slotIndex) {
     }
     client.stop();
     isSSEClient[slotIndex] = false;
+  } else if (request.indexOf("POST /api/clearShield") >= 0) {
+    // 清空所有屏蔽点
+    clearShielding();
+    client.print(getHTTPResponse("application/json", "{\"status\":\"ok\",\"message\":\"All shielding cleared\"}"));
+    client.stop();
+    isSSEClient[slotIndex] = false;
   } else if (request.indexOf("GET /api/baselineDelay") >= 0) {
     String json = getBaselineDelayJSON();
     client.print(getHTTPResponse("application/json", json));
@@ -235,6 +244,26 @@ void LaserWebServer::handleHTTPRequest(WiFiClient &client, int slotIndex) {
     if (deserializeJson(doc, body) == DeserializationError::Ok) {
       setBaselineDelay(doc["delay"]);
       client.print(getHTTPResponse("application/json", getBaselineDelayJSON()));
+    }
+    client.stop();
+    isSSEClient[slotIndex] = false;
+  } else if (request.indexOf("GET /api/triggerFilter") >= 0) {
+    String json = getTriggerFilterJSON();
+    client.print(getHTTPResponse("application/json", json));
+    client.stop();
+    isSSEClient[slotIndex] = false;
+  } else if (request.indexOf("POST /api/triggerFilter") >= 0) {
+    String body = "";
+    while (client.available())
+      body += (char)client.read();
+    DynamicJsonDocument doc(256);
+    if (deserializeJson(doc, body) == DeserializationError::Ok) {
+      int threshold = doc["threshold"];
+      triggerFilterThreshold = threshold;
+      if (triggerFilterCallback != nullptr) {
+        triggerFilterCallback(threshold);
+      }
+      client.print(getHTTPResponse("application/json", getTriggerFilterJSON()));
     }
     client.stop();
     isSSEClient[slotIndex] = false;
@@ -379,8 +408,12 @@ String LaserWebServer::getHTMLPage() {
   html +=
       "            <input type=\"number\" id=\"delay-input\" value=\"200\">\n";
   html += "            <button onclick=\"updateDelay()\">Set Delay</button>\n";
+  html += "            <label style=\"margin-left: 15px;\">Trigger Filter:</label>\n";
+  html += "            <input type=\"number\" id=\"filter-input\" value=\"20\" style=\"width: 60px;\">\n";
+  html += "            <button onclick=\"updateFilter()\">Set Filter</button>\n";
   html += "            <button class=\"secondary\" onclick=\"toggleConfig()\" "
           "id=\"config-btn\">Enter Shield Config</button>\n";
+  html += "            <button class=\"danger\" onclick=\"clearAllShielding()\">Clear All Shields</button>\n";
   html += "            <div style=\"margin-left: auto;\">\n";
   html += "                <input type=\"file\" id=\"ota-file\" "
           "style=\"display:none\">\n";
@@ -400,12 +433,28 @@ String LaserWebServer::getHTMLPage() {
   html += "        let eventSource = null;\n";
   html += "\n";
   html += "        function init() {\n";
-  html += "            fetch('/api/shield').then(r => r.json()).then(d => "
-          "shieldMask = d);\n";
+  html += "            fetch('/api/shield').then(r => r.json()).then(d => {\n";
+  html += "                shieldMask = d;\n";
+  html += "                applyShieldMask();\n";
+  html += "            });\n";
   html += "            fetch('/api/baselineDelay').then(r => r.json()).then(d "
           "=> document.getElementById('delay-input').value = d.delay);\n";
+  html += "            fetch('/api/triggerFilter').then(r => r.json()).then(d "
+          "=> document.getElementById('filter-input').value = d.threshold);\n";
   html += "            setupSSE();\n";
   html += "            renderEmpty();\n";
+  html += "        }\n";
+  html += "\n";
+  html += "        function applyShieldMask() {\n";
+  html += "            for(let d=1; d<=4; d++) {\n";
+  html += "                const key = 'device' + d;\n";
+  html += "                if(shieldMask[key]) {\n";
+  html += "                    shieldMask[key].forEach(inputId => {\n";
+  html += "                        const led = document.getElementById('l-' + d + '-' + inputId);\n";
+  html += "                        if(led) led.classList.add('shielded');\n";
+  html += "                    });\n";
+  html += "                }\n";
+  html += "            }\n";
   html += "        }\n";
   html += "\n";
   html += "        function setupSSE() {\n";
@@ -504,6 +553,27 @@ String LaserWebServer::getHTMLPage() {
           "JSON.stringify({ delay: parseInt(val) }) });\n";
   html += "        }\n";
   html += "\n";
+  html += "        function updateFilter() {\n";
+  html += "            const val = document.getElementById('filter-input').value;\n";
+  html += "            fetch('/api/triggerFilter', { method: 'POST', body: "
+          "JSON.stringify({ threshold: parseInt(val) }) })\n";
+  html += "            .then(r => r.json()).then(d => {\n";
+  html += "                alert('Trigger filter set to ' + d.threshold + ' points');\n";
+  html += "            });\n";
+  html += "        }\n";
+  html += "\n";
+  html += "        function clearAllShielding() {\n";
+  html += "            if(!confirm('Clear all shielding points?')) return;\n";
+  html += "            fetch('/api/clearShield', { method: 'POST' })\n";
+  html += "            .then(r => r.json()).then(res => {\n";
+  html += "                shieldMask = {};\n";
+  html += "                document.querySelectorAll('.led.shielded').forEach(led => {\n";
+  html += "                    led.classList.remove('shielded');\n";
+  html += "                });\n";
+  html += "                alert('All shielding cleared!');\n";
+  html += "            });\n";
+  html += "        }\n";
+  html += "\n";
   html += "        function doOTA() {\n";
   html += "            const file = "
           "document.getElementById('ota-file').files[0];\n";
@@ -586,4 +656,42 @@ void LaserWebServer::setShieldingChangeCallback(
     ShieldingChangeCallback callback) {
   shieldingChangeCallback = callback;
   Serial.println("Shielding change callback registered");
+}
+
+void LaserWebServer::clearShielding() {
+  // 清空所有屏蔽点
+  memset(shieldMask, 0, sizeof(shieldMask));
+  Serial.println("All shielding points cleared");
+  
+  // 触发回调通知 main.cpp
+  if (clearShieldingCallback != nullptr) {
+    clearShieldingCallback();
+  }
+}
+
+void LaserWebServer::setClearShieldingCallback(ClearShieldingCallback callback) {
+  clearShieldingCallback = callback;
+  Serial.println("Clear shielding callback registered");
+}
+
+String LaserWebServer::getTriggerFilterJSON() {
+  DynamicJsonDocument doc(256);
+  doc["threshold"] = triggerFilterThreshold;
+
+  String output;
+  serializeJson(doc, output);
+  return output;
+}
+
+void LaserWebServer::setTriggerFilterThreshold(int threshold) {
+  triggerFilterThreshold = threshold;
+}
+
+int LaserWebServer::getTriggerFilterThreshold() {
+  return triggerFilterThreshold;
+}
+
+void LaserWebServer::setTriggerFilterCallback(TriggerFilterCallback callback) {
+  triggerFilterCallback = callback;
+  Serial.println("Trigger filter callback registered");
 }

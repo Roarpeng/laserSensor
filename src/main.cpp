@@ -15,6 +15,13 @@
 const char *ssid = "LC_01";
 const char *password = "12345678";
 
+// ============== 静态IP配置 ==============
+IPAddress local_IP(192, 168, 10, 71);
+IPAddress gateway(192, 168, 10, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress primaryDNS(223, 5, 5, 5);
+IPAddress secondaryDNS(223, 6, 6, 6);
+
 // ============== MQTT 代理设置 ==============
 const char *mqtt_server = "192.168.10.80";
 const char *mqtt_client_id = "receiver";
@@ -91,6 +98,13 @@ int baselineDeviceCounts[NUM_DEVICES];
 // [新增] 存储每个设备当前的连续异常计数
 int currentConsecutiveErrors[NUM_DEVICES];
 
+// [新增] 设备读取失败计数（策略C）
+int deviceReadFailCount[NUM_DEVICES];
+const int READ_FAIL_THRESHOLD = 3;  // 连续失败3次才认为设备异常
+
+// [新增] 触发点过滤阈值（大于此数量的点同时触发则过滤）
+int triggerFilterThreshold = 20;  // 默认20个点
+
 bool triggerSent = false;
 
 // [新增] 加载/保存屏蔽配置
@@ -126,6 +140,28 @@ void saveShieldingConfig() {
   }
   Serial.printf("Total: %d/192 points shielded, saved to Flash\n",
                 totalShielded);
+}
+
+// [新增] 加载触发过滤阈值
+void loadTriggerFilterThreshold() {
+  preferences.begin("trigger", false);
+  triggerFilterThreshold = preferences.getInt("filterThreshold", 20);
+  preferences.end();
+  Serial.printf("Trigger filter threshold loaded: %d\n", triggerFilterThreshold);
+}
+
+// [新增] 保存触发过滤阈值
+void saveTriggerFilterThreshold(int threshold) {
+  preferences.begin("trigger", false);
+  preferences.putInt("filterThreshold", threshold);
+  preferences.end();
+  Serial.printf("Trigger filter threshold saved: %d\n", threshold);
+}
+
+// [新增] 设置触发过滤阈值的回调
+void onTriggerFilterThresholdChanged(int threshold) {
+  triggerFilterThreshold = threshold;
+  saveTriggerFilterThreshold(threshold);
 }
 
 // [新增] 重新计算每个设备的有效基线点数
@@ -166,6 +202,20 @@ void onShieldingChanged(uint8_t deviceAddr, uint8_t inputNum, bool state) {
   }
 }
 
+// Callback handler for clearing all shielding from WebServer
+void onClearShielding() {
+  // Clear global storage
+  memset(globalShielding, 0, sizeof(globalShielding));
+  
+  // Save to Flash
+  saveShieldingConfig();
+  
+  // Recalculate baseline
+  recalculateBaselineCounts();
+  
+  Serial.println("All shielding cleared from Flash, baseline recalculated");
+}
+
 void setup_wifi() {
   delay(10);
   Serial.println();
@@ -175,6 +225,12 @@ void setup_wifi() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
+  
+  // 配置静态IP
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    Serial.println("STA Failed to configure static IP");
+  }
+  
   WiFi.begin(ssid, password);
 
   int timeout = 0;
@@ -409,26 +465,31 @@ bool checkForChanges() {
     return false;
 
   uint8_t currentScan[NUM_DEVICES][NUM_INPUTS_PER_DEVICE];
-  bool anyDeviceTriggered = false; // 只要有一个设备确认触发，就置为true
+  bool deviceReadSuccess[NUM_DEVICES] = {false, false, false, false};
+  bool anyDeviceTriggered = false;
+  int totalMissingBits = 0;  // 累计所有设备的缺失点数
 
-  // 1. 扫描所有设备
-  bool scanFailed = false;
+  // 1. 扫描所有设备，记录读取成功/失败
   for (int d = 1; d <= NUM_DEVICES; d++) {
     if (readInputStatus(d, currentScan[d - 1])) {
-      // Update WebUI with real-time status as soon as we get it
+      deviceReadSuccess[d - 1] = true;
+      deviceReadFailCount[d - 1] = 0;  // 重置失败计数
       webServer.updateAllDeviceStates(d, currentScan[d - 1]);
     } else {
-      Serial.printf("Monitor scan failed at Device %d\n", d);
-      scanFailed = true;
-      // Initialize with zeros or keep old data if preferred, but here we'll
-      // zero it out for safety
-      memset(currentScan[d - 1], 0, NUM_INPUTS_PER_DEVICE);
+      deviceReadFailCount[d - 1]++;
+      Serial.printf("Dev %d read failed (count: %d/%d)\n", d, 
+                    deviceReadFailCount[d - 1], READ_FAIL_THRESHOLD);
+      
+      // 策略C：连续失败达到阈值才认为设备异常
+      if (deviceReadFailCount[d - 1] >= READ_FAIL_THRESHOLD) {
+        Serial.printf("Dev %d marked as OFFLINE after %d consecutive failures\n", 
+                      d, READ_FAIL_THRESHOLD);
+        // 设备离线，用上一次的数据或保持不动
+        // 这里可以选择保持之前的扫描结果，或跳过
+      }
+      deviceReadSuccess[d - 1] = false;
     }
     delay(3);
-  }
-
-  if (scanFailed) {
-    lastReadFailTime = millis();
   }
 
   // 2. 打印日志 (每200ms) 并广播到 WebServer
@@ -438,44 +499,44 @@ bool checkForChanges() {
     webServer.broadcastStates();
   }
 
-  // 3. 逐个设备独立判断 (使用逐位比较)
+  // 3. 逐个设备独立判断
   for (int d = 0; d < NUM_DEVICES; d++) {
-    // 逐位比较：计算 (baseline AND NOT shield) vs (current AND NOT shield)
-    // 只有当 maskedBaseline[i]==1 且 maskedCurrent[i]==0 时才算缺失
+    // 策略A：设备读取失败时跳过触发判断
+    if (!deviceReadSuccess[d]) {
+      Serial.printf("Dev %d: SKIPPED (read failed)\n", d + 1);
+      continue;
+    }
+
+    // 逐位比较
     int missingBits = 0;
     for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
       bool isShielded = webServer.getShieldState(d + 1, i + 1);
-      // 应用屏蔽：屏蔽位强制为0
       uint8_t maskedBaseline = isShielded ? 0 : baseline[d][i];
       uint8_t maskedCurrent = isShielded ? 0 : currentScan[d][i];
 
-      // 只有基线为1且当前为0才算缺失
       if (maskedBaseline == 1 && maskedCurrent == 0) {
         missingBits++;
       }
     }
 
-    // [调试日志] 每2秒打印一次详细的对比数据
+    totalMissingBits += missingBits;
+
+    // [调试日志] 每2秒打印一次
     static unsigned long lastDebugLog = 0;
     if (millis() - lastDebugLog > 2000) {
-      Serial.printf("[DEBUG] Dev %d: MissingBits=%d (bitwise)\n", d + 1,
-                    missingBits);
+      Serial.printf("[DEBUG] Dev %d: MissingBits=%d (bitwise)\n", d + 1, missingBits);
     }
 
-    // 获取该设备的配置参数
     int myTolerance = DEVICE_TOLERANCE[d];
     int myDebounceTarget = DEVICE_DEBOUNCE[d];
 
-    // 判断逻辑：缺失位数 >= 容差
     if (missingBits >= myTolerance) {
       currentConsecutiveErrors[d]++;
 
-      Serial.printf(
-          ">> Dev %d ALARM: Missing %d bits (Thresh %d). Count %d/%d\n", d + 1,
-          missingBits, myTolerance, currentConsecutiveErrors[d],
-          myDebounceTarget);
+      Serial.printf(">> Dev %d ALARM: Missing %d bits (Thresh %d). Count %d/%d\n", 
+                    d + 1, missingBits, myTolerance, 
+                    currentConsecutiveErrors[d], myDebounceTarget);
 
-      // [诊断] 首次报警时，打印具体缺失的位置
       if (currentConsecutiveErrors[d] == 1) {
         Serial.printf("   Missing positions: ");
         for (int i = 0; i < NUM_INPUTS_PER_DEVICE; i++) {
@@ -500,17 +561,23 @@ bool checkForChanges() {
       currentConsecutiveErrors[d] = 0;
     }
 
-    // Reset debug timer after all devices logged
     if (d == NUM_DEVICES - 1 && millis() - lastDebugLog > 2000) {
       lastDebugLog = millis();
     }
   }
 
-  // 4. 如果有任意一个设备满足了触发条件
+  // 4. 触发判断 + 过滤阈值检查
   if (anyDeviceTriggered) {
-    Serial.println(">>> TRIGGER CONFIRMED (By at least one device) <<<");
-    // 重置所有计数器？或者保留？
-    // 这里选择重置，以便下一个周期重新检测
+    // [新功能] 触发点过滤：如果缺失点数超过阈值，认为是误触发
+    if (triggerFilterThreshold > 0 && totalMissingBits >= triggerFilterThreshold) {
+      Serial.printf(">>> TRIGGER FILTERED: TotalMissing=%d >= Threshold=%d <<<\n", 
+                    totalMissingBits, triggerFilterThreshold);
+      for (int i = 0; i < NUM_DEVICES; i++)
+        currentConsecutiveErrors[i] = 0;
+      return false;  // 过滤掉这次触发
+    }
+    
+    Serial.printf(">>> TRIGGER CONFIRMED: TotalMissing=%d <<<\n", totalMissingBits);
     for (int i = 0; i < NUM_DEVICES; i++)
       currentConsecutiveErrors[i] = 0;
     return true;
@@ -557,6 +624,11 @@ void setup() {
   loadShieldingConfig();                                    // [新增] 加载配置
   webServer.loadShielding(globalShielding);                 // 同步到 WebServer
   webServer.setShieldingChangeCallback(onShieldingChanged); // 注册回调
+  webServer.setClearShieldingCallback(onClearShielding);    // 注册清空回调
+
+  loadTriggerFilterThreshold();                             // 加载过滤阈值
+  webServer.setTriggerFilterThreshold(triggerFilterThreshold);  // 同步到 WebServer
+  webServer.setTriggerFilterCallback(onTriggerFilterThresholdChanged);  // 注册回调
 
   currentState = ACTIVE;
   Serial.println("System ready.");
